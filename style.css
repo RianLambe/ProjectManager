@@ -4,6 +4,7 @@
   --bg-card-header: #22262f;
   --border: #2c3038;
   --border-soft: #262a33;
+  --connector: #4b5262;
   --text: #e7e9ee;
   --text-dim: #9aa1ad;
   --text-faint: #676e7a;
@@ -39,16 +40,95 @@ html, body {
   z-index: 10;
 }
 
-.topbar h1 {
+.project-switcher {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.project-name {
   font-size: 18px;
   font-weight: 600;
-  margin: 0;
   letter-spacing: 0.2px;
+  outline: none;
+  border-radius: 5px;
+  padding: 2px 6px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.project-name:focus {
+  background: var(--bg-card);
+  box-shadow: 0 0 0 2px var(--accent-dim);
 }
 
 .topbar-actions {
   display: flex;
+  align-items: center;
   gap: 8px;
+}
+
+.project-menu {
+  position: fixed;
+  top: 60px;
+  left: 24px;
+  width: 260px;
+  max-width: calc(100vw - 48px);
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 20px 60px rgba(0,0,0,0.4);
+  z-index: 50;
+  padding: 6px;
+}
+.project-menu[hidden] { display: none; }
+
+.project-menu-list {
+  display: flex;
+  flex-direction: column;
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+.project-menu-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  border-radius: 7px;
+}
+.project-menu-row:hover {
+  background: #262a33;
+}
+.project-menu-row.active .project-menu-name {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.project-menu-name {
+  flex: 1;
+  text-align: left;
+  background: transparent;
+  border: none;
+  color: var(--text);
+  font-size: 14px;
+  padding: 9px 10px;
+  cursor: pointer;
+  border-radius: 7px;
+  overflow-wrap: anywhere;
+}
+
+.project-menu-delete {
+  opacity: 0;
+  flex: 0 0 auto;
+  margin-right: 4px;
+}
+.project-menu-row:hover .project-menu-delete {
+  opacity: 1;
+}
+
+.project-menu-add {
+  width: 100%;
+  margin-top: 4px;
 }
 
 .btn {
@@ -154,6 +234,20 @@ html, body {
   border-color: var(--text-dim);
 }
 
+.hamburger-btn {
+  opacity: 1;
+  flex: 0 0 30px;
+  width: 30px;
+  height: 30px;
+  border-radius: 7px;
+  color: var(--text-dim);
+}
+.hamburger-btn:hover {
+  background: #262a33;
+  color: var(--text);
+}
+.hamburger-btn svg { width: 16px; height: 16px; }
+
 .board {
   display: flex;
   flex-wrap: wrap;
@@ -163,7 +257,8 @@ html, body {
 }
 
 .tree-card {
-  background: var(--bg-card);
+  position: relative;
+  background: var(--card-bg, var(--bg-card));
   border: 1px solid var(--border);
   border-radius: var(--radius);
   width: 340px;
@@ -212,7 +307,26 @@ html, body {
 }
 
 .tree-progress-wrap {
-  margin-top: 10px;
+  margin-top: 12px;
+}
+
+.board-progress {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+}
+
+.board-progress-bar {
+  flex: 1 1 auto;
+  width: auto;
+  height: 10px;
+  border-radius: 5px;
+}
+
+.board-progress .progress-pct {
+  font-size: 12px;
+  flex: 0 0 auto;
 }
 
 .tree-body {
@@ -236,36 +350,75 @@ html, body {
    so it doesn't dangle past the final branch. */
 
 .root-list {
+  position: relative;
   margin-left: 11px;
   padding-left: 20px;
-  border-left: 1px solid var(--border-soft);
 }
 .node-list .node-list {
+  position: relative;
   margin-left: 12px;
   padding-left: 20px;
   padding-top: 3px;
-  border-left: 1px solid var(--border-soft);
+}
+
+/* The trunk itself is drawn as a filled rectangle rather than a border, so it
+   renders through the exact same path as the horizontal stubs below - a
+   border and an absolutely-positioned fill don't always anti-alias/round to
+   the same pixel, which is what made the elbows look slightly uneven. */
+.root-list::before,
+.node-list .node-list::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 2px;
+  background: var(--connector);
 }
 
 .root-list > .node-item::before,
 .node-list .node-list > .node-item::before {
   content: "";
   position: absolute;
-  top: 15px;
+  top: 14.5px;
   left: -20px;
-  width: 20px;
-  height: 1px;
-  background: var(--border-soft);
+  /* reaches a couple px past the marker's edge on purpose - the marker (set
+     to z-index:1) sits on top and hides the overlap, which is more reliable
+     than lining the two edges up exactly and hoping sub-pixel rounding agrees */
+  width: 25px;
+  height: 2px;
+  background: var(--connector);
 }
 .root-list > .node-item:last-child::after,
 .node-list .node-list > .node-item:last-child::after {
   content: "";
   position: absolute;
-  top: 15px;
-  left: -21px;
+  /* starts right at the BOTTOM of the horizontal stub (14.5px + 2px tall), not
+     level with its top - otherwise this mask (painted after/on top of the
+     stub) erases the top slice of the elbow corner itself along with the
+     trunk below it, leaving the corner looking chopped off */
+  top: 16.5px;
+  left: -21.5px;
   bottom: 0;
-  width: 3px;
-  background: var(--bg-card);
+  width: 4px;
+  background: var(--card-bg, var(--bg-card));
+}
+
+/* A branch's own row can grow taller than its circle (e.g. the progress bar
+   line beneath its name), which used to leave a visible gap between the
+   circle and the top of its children's trunk. This real element (not a
+   pseudo-element - both ::before and ::after on .node-item are already
+   spoken for) fills that gap, anchored to the circle itself rather than to
+   the row's height. */
+.trunk-filler {
+  content: "";
+  position: absolute;
+  top: 26px;
+  left: 12px;
+  width: 2px;
+  height: 22px;
+  background: var(--connector);
+  pointer-events: none;
 }
 
 .node-row {
@@ -280,6 +433,7 @@ html, body {
 }
 
 .caret {
+  z-index: 1;
   border: 1.5px solid var(--text-dim);
   border-radius: 50%;
   background: var(--bg-card-header);
@@ -289,7 +443,7 @@ html, body {
   height: 21px;
   flex: 0 0 21px;
   padding: 0;
-  margin-top: 1px;
+  margin: 1px 0 0 0;
   font-size: 11px;
   display: flex;
   align-items: center;
@@ -304,12 +458,13 @@ html, body {
 .caret.collapsed { transform: rotate(-90deg); }
 
 .leaf-checkbox {
+  z-index: 1;
   appearance: none;
   -webkit-appearance: none;
   flex: 0 0 21px;
   width: 21px;
   height: 21px;
-  margin-top: 1px;
+  margin: 1px 0 0 0;
   border: 1.5px solid var(--text-dim);
   border-radius: 6px;
   background: #10131a;

@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "tree-task-board",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-m", "http.server", "8744"],
+      "port": 8744
+    }
+  ]
+}

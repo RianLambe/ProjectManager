@@ -8,24 +8,29 @@
 </head>
 <body>
   <header class="topbar">
-    <h1>Tree Task Board</h1>
+    <div class="project-switcher">
+      <button id="projectMenuBtn" class="icon-btn hamburger-btn" title="Switch project"></button>
+      <span id="projectName" class="project-name" contenteditable="true" spellcheck="false" data-role="rename"></span>
+    </div>
     <div class="topbar-actions">
       <span id="syncStatus" class="sync-status">Connecting...</span>
-      <button id="newTreeBtn" class="btn btn-primary">+ New Tree</button>
-      <button id="exportBtn" class="btn btn-ghost" title="Export board to a JSON file">Export</button>
-      <button id="importBtn" class="btn btn-ghost" title="Import board from a JSON file">Import</button>
-      <input type="file" id="importInput" accept="application/json" hidden>
+      <button id="newTreeBtn" class="btn btn-primary">+ New Board</button>
       <input type="color" id="colorPickerInput" hidden>
     </div>
   </header>
+
+  <div id="projectMenu" class="project-menu" hidden>
+    <div id="projectMenuList" class="project-menu-list"></div>
+    <button id="addProjectBtn" class="btn btn-ghost project-menu-add">+ New Project</button>
+  </div>
 
   <main id="board" class="board">
     <!-- tree cards get rendered here -->
   </main>
 
   <div id="emptyState" class="empty-state" hidden>
-    <p>No trees yet.</p>
-    <button id="emptyNewTreeBtn" class="btn btn-primary">Create your first tree</button>
+    <p>No boards yet.</p>
+    <button id="emptyNewTreeBtn" class="btn btn-primary">Create your first board</button>
   </div>
 
   <div id="detailsOverlay" class="details-overlay" hidden>

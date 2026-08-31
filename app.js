@@ -19,8 +19,13 @@ import { firebaseConfig } from "./firebase-config.js";
   var board = document.getElementById("board");
   var emptyState = document.getElementById("emptyState");
   var syncStatusEl = document.getElementById("syncStatus");
+  var projectNameEl = document.getElementById("projectName");
+  var hamburgerBtn = document.getElementById("projectMenuBtn");
+  var projectMenu = document.getElementById("projectMenu");
+  var projectMenuList = document.getElementById("projectMenuList");
+  var addProjectBtn = document.getElementById("addProjectBtn");
 
-  var state = { trees: [] };
+  var state = normalizeState(null);
   var focusRequest = null; // id of a node to focus+select after next render
   var dragId = null; // id of node currently being dragged
   var detailsId = null; // id of the node currently open in the details panel
@@ -33,8 +38,11 @@ import { firebaseConfig } from "./firebase-config.js";
     caret: '<svg viewBox="0 0 24 24" width="12" height="12"><path d="M6 9l6 6 6-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>',
     plus: '<svg viewBox="0 0 24 24" width="14" height="14"><path d="M12 5v14M5 12h14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>',
     trash: '<svg viewBox="0 0 24 24" width="14" height="14"><path d="M4 7h16M9 7V4h6v3M6 7l1 13a1 1 0 001 1h8a1 1 0 001-1l1-13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>',
-    close: '<svg viewBox="0 0 24 24" width="16" height="16"><path d="M6 6l12 12M18 6L6 18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>'
+    close: '<svg viewBox="0 0 24 24" width="16" height="16"><path d="M6 6l12 12M18 6L6 18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>',
+    menu: '<svg viewBox="0 0 24 24" width="16" height="16"><path d="M4 6h16M4 12h16M4 18h16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>'
   };
+
+  hamburgerBtn.innerHTML = ICONS.menu;
 
   // ---------- persistence (Firestore, live across devices) ----------
 
@@ -59,8 +67,32 @@ import { firebaseConfig } from "./firebase-config.js";
     return false;
   }
 
+  // Board data is grouped under projects: { projects: [{id, name, trees:[...]}], currentProjectId }.
+  // Accepts the old flat { trees: [...] } shape too and wraps it in a default
+  // project, so existing boards survive the upgrade to projects.
+  function normalizeState(data) {
+    if (data && Array.isArray(data.projects) && data.projects.length > 0) {
+      var validId = data.currentProjectId && data.projects.some(function (p) { return p.id === data.currentProjectId; });
+      return {
+        projects: data.projects,
+        currentProjectId: validId ? data.currentProjectId : data.projects[0].id
+      };
+    }
+    if (data && Array.isArray(data.trees)) {
+      var migrated = { id: uid(), name: "My Project", createdAt: Date.now(), trees: data.trees };
+      return { projects: [migrated], currentProjectId: migrated.id };
+    }
+    var fresh = { id: uid(), name: "My Project", createdAt: Date.now(), trees: [] };
+    return { projects: [fresh], currentProjectId: fresh.id };
+  }
+
+  function currentProject() {
+    var found = state.projects.filter(function (p) { return p.id === state.currentProjectId; })[0];
+    return found || state.projects[0];
+  }
+
   function applyRemoteState(data) {
-    state = data && Array.isArray(data.trees) ? data : { trees: [] };
+    state = normalizeState(data);
     render();
     if (detailsId) renderDetails();
   }
@@ -98,7 +130,7 @@ import { firebaseConfig } from "./firebase-config.js";
         boardDocRef,
         function (snap) {
           if (!snap.exists()) {
-            setDoc(boardDocRef, { trees: [] });
+            setDoc(boardDocRef, normalizeState(null));
             return;
           }
           var data = snap.data();
@@ -174,13 +206,20 @@ import { firebaseConfig } from "./firebase-config.js";
     return { done: done, total: total };
   }
 
-  // Finds a node by id anywhere in the board.
+  // Finds a project, board, or task by id.
   // Returns { node, siblings, index, tree } or null.
   function findNode(id) {
-    for (var t = 0; t < state.trees.length; t++) {
-      var tree = state.trees[t];
+    for (var p = 0; p < state.projects.length; p++) {
+      if (state.projects[p].id === id) {
+        return { node: state.projects[p], siblings: state.projects, index: p, tree: null };
+      }
+    }
+    var project = currentProject();
+    if (!project) return null;
+    for (var t = 0; t < project.trees.length; t++) {
+      var tree = project.trees[t];
       if (tree.id === id) {
-        return { node: tree, siblings: state.trees, index: t, tree: tree };
+        return { node: tree, siblings: project.trees, index: t, tree: tree };
       }
       var res = findIn(tree.children, id, tree);
       if (res) return res;
@@ -211,12 +250,92 @@ import { firebaseConfig } from "./firebase-config.js";
   // ---------- mutations ----------
 
   function addTree() {
-    var tree = makeNode("New Tree");
-    state.trees.push(tree);
+    var project = currentProject();
+    if (!project) return;
+    var tree = makeNode("New Board");
+    project.trees.push(tree);
     focusRequest = tree.id;
     pendingNewId = tree.id;
     saveState();
     render();
+  }
+
+  function addProject() {
+    var project = { id: uid(), name: "New Project", createdAt: Date.now(), trees: [] };
+    state.projects.push(project);
+    state.currentProjectId = project.id;
+    focusRequest = project.id;
+    pendingNewId = project.id;
+    saveState();
+    render();
+    closeProjectMenu();
+  }
+
+  function switchProject(id) {
+    closeProjectMenu();
+    if (id === state.currentProjectId) return;
+    var exists = state.projects.some(function (p) { return p.id === id; });
+    if (!exists) return;
+    state.currentProjectId = id;
+    saveState();
+    render();
+  }
+
+  function deleteProject(id) {
+    if (state.projects.length <= 1) return;
+    var proj = state.projects.filter(function (p) { return p.id === id; })[0];
+    if (!proj) return;
+    showConfirm('Delete project "' + proj.name + '" and everything in it?', function () {
+      var idx = -1;
+      for (var i = 0; i < state.projects.length; i++) {
+        if (state.projects[i].id === id) { idx = i; break; }
+      }
+      if (idx === -1 || state.projects.length <= 1) return;
+      state.projects.splice(idx, 1);
+      if (state.currentProjectId === id) {
+        state.currentProjectId = state.projects[0].id;
+      }
+      saveState();
+      render();
+      renderProjectMenu();
+    });
+  }
+
+  function renderProjectMenu() {
+    projectMenuList.innerHTML = "";
+    state.projects.forEach(function (p) {
+      var row = document.createElement("div");
+      row.className = "project-menu-row" + (p.id === state.currentProjectId ? " active" : "");
+
+      if (state.projects.length > 1) {
+        var delBtn = document.createElement("button");
+        delBtn.className = "icon-btn danger project-menu-delete";
+        delBtn.title = "Delete project";
+        delBtn.innerHTML = ICONS.trash;
+        delBtn.addEventListener("click", function (e) {
+          e.stopPropagation();
+          deleteProject(p.id);
+        });
+        row.appendChild(delBtn);
+      }
+
+      var nameBtn = document.createElement("button");
+      nameBtn.className = "project-menu-name";
+      nameBtn.textContent = p.name;
+      nameBtn.addEventListener("click", function () { switchProject(p.id); });
+      row.appendChild(nameBtn);
+
+      projectMenuList.appendChild(row);
+    });
+  }
+
+  function openProjectMenu() {
+    renderProjectMenu();
+    projectMenu.hidden = false;
+  }
+
+  function closeProjectMenu() {
+    projectMenu.hidden = true;
   }
 
   // Removes a node with no confirmation dialog - used to silently discard a
@@ -247,10 +366,10 @@ import { firebaseConfig } from "./firebase-config.js";
   function deleteTree(id, onDeleted) {
     var found = findNode(id);
     if (!found) return;
-    showConfirm('Delete tree "' + found.node.name + '" and everything in it?', function () {
+    showConfirm('Delete board "' + found.node.name + '" and everything in it?', function () {
       var fresh = findNode(id);
       if (!fresh) return;
-      state.trees.splice(fresh.index, 1);
+      fresh.siblings.splice(fresh.index, 1);
       saveState();
       render();
       if (onDeleted) onDeleted();
@@ -336,8 +455,10 @@ import { firebaseConfig } from "./firebase-config.js";
 
   // Returns an array of nodes from the root tree down to (and including) id, or [] if not found.
   function buildPath(id) {
-    for (var t = 0; t < state.trees.length; t++) {
-      var path = search(state.trees[t], id, [state.trees[t]]);
+    var project = currentProject();
+    if (!project) return [];
+    for (var t = 0; t < project.trees.length; t++) {
+      var path = search(project.trees[t], id, [project.trees[t]]);
       if (path) return path;
     }
     return [];
@@ -388,7 +509,7 @@ import { firebaseConfig } from "./firebase-config.js";
     var src = findNode(sourceId);
     if (!src) return;
     if (src.node.id === treeId) return;
-    var tree = state.trees.filter(function (t) { return t.id === treeId; })[0];
+    var tree = currentProject().trees.filter(function (t) { return t.id === treeId; })[0];
     if (!tree) return;
     if (isDescendant(src.node, treeId)) return;
     src.siblings.splice(src.index, 1);
@@ -400,13 +521,19 @@ import { firebaseConfig } from "./firebase-config.js";
   // ---------- rendering ----------
 
   function render() {
+    var project = currentProject();
+
+    projectNameEl.textContent = project.name;
+    projectNameEl.setAttribute("data-id", project.id);
+    document.title = project.name;
+
     board.innerHTML = "";
-    emptyState.hidden = state.trees.length > 0;
-    for (var i = 0; i < state.trees.length; i++) {
-      board.appendChild(renderTreeCard(state.trees[i]));
+    emptyState.hidden = project.trees.length > 0;
+    for (var i = 0; i < project.trees.length; i++) {
+      board.appendChild(renderTreeCard(project.trees[i]));
     }
     if (focusRequest) {
-      var toFocus = board.querySelector('[data-id="' + cssEscape(focusRequest) + '"] > .node-row > .node-main > .node-label-wrap > .node-name, [data-tree-id="' + cssEscape(focusRequest) + '"] .tree-name');
+      var toFocus = document.querySelector('[data-id="' + cssEscape(focusRequest) + '"] > .node-row > .node-main > .node-label-wrap > .node-name, [data-tree-id="' + cssEscape(focusRequest) + '"] .tree-name, #projectName[data-id="' + cssEscape(focusRequest) + '"]');
       if (toFocus) {
         toFocus.focus();
         selectAllText(toFocus);
@@ -438,18 +565,40 @@ import { firebaseConfig } from "./firebase-config.js";
     return "rgba(" + r + "," + g + "," + b + "," + alpha + ")";
   }
 
+  // Blends hex into baseHex at the given strength and returns a fully OPAQUE
+  // color. Used (instead of a translucent rgba) for any fill that something
+  // else - like the connector-line mask - may need to sit flush against or
+  // stack on top of: two translucent layers of the "same" color still show a
+  // seam where they overlap, because compositing them twice isn't the same
+  // as compositing once. A solid color has no such seam.
+  function blendHex(hex, alpha, baseHex) {
+    var c = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex || "");
+    var base = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(baseHex || "");
+    if (!c || !base) return null;
+    var r = Math.round(parseInt(c[1], 16) * alpha + parseInt(base[1], 16) * (1 - alpha));
+    var g = Math.round(parseInt(c[2], 16) * alpha + parseInt(base[2], 16) * (1 - alpha));
+    var b = Math.round(parseInt(c[3], 16) * alpha + parseInt(base[3], 16) * (1 - alpha));
+    return "rgb(" + r + "," + g + "," + b + ")";
+  }
+
   function renderTreeCard(tree) {
     var card = document.createElement("div");
     card.className = "tree-card";
     card.setAttribute("data-tree-id", tree.id);
     if (tree.color) {
-      card.style.background = hexToRgba(tree.color, 0.12);
+      // set as a custom property (not the background shorthand directly) so
+      // anything that needs to blend with the card - like the connector-line
+      // mask that hides the trunk past the last item - can reference the same
+      // color via var(--card-bg, ...) instead of drifting out of sync with it.
+      // Solid (not translucent) so a mask sitting on top of the card's own
+      // background doesn't double up into a visibly darker/more saturated patch.
+      card.style.setProperty("--card-bg", blendHex(tree.color, 0.12, "#1c1f28"));
       card.style.borderColor = hexToRgba(tree.color, 0.4);
     }
 
     var header = document.createElement("div");
     header.className = "tree-card-header";
-    if (tree.color) header.style.background = hexToRgba(tree.color, 0.28);
+    if (tree.color) header.style.background = blendHex(tree.color, 0.28, "#22262f");
 
     var top = document.createElement("div");
     top.className = "tree-card-header-top";
@@ -471,7 +620,7 @@ import { firebaseConfig } from "./firebase-config.js";
 
     var deleteBtn = document.createElement("button");
     deleteBtn.className = "icon-btn danger";
-    deleteBtn.title = "Delete tree";
+    deleteBtn.title = "Delete board";
     deleteBtn.setAttribute("data-id", tree.id);
     deleteBtn.setAttribute("data-role", "delete-tree");
     deleteBtn.innerHTML = ICONS.trash;
@@ -496,13 +645,14 @@ import { firebaseConfig } from "./firebase-config.js";
     if (progress.total > 0) {
       var pct = Math.round((progress.done / progress.total) * 100);
       progWrap.innerHTML =
-        '<div class="node-progress">' +
-          '<div class="progress-bar"><div class="progress-bar-fill" style="width:' + pct + '%"></div></div>' +
+        '<div class="board-progress">' +
+          '<div class="progress-bar board-progress-bar"><div class="progress-bar-fill" style="width:' + pct + '%"></div></div>' +
           '<span class="progress-pct ' + pctColorClass(pct) + '">' + pct + '% (' + progress.done + '/' + progress.total + ')</span>' +
         '</div>';
     }
     header.appendChild(progWrap);
     card.appendChild(header);
+
 
     var body = document.createElement("div");
     body.className = "tree-body";
@@ -626,6 +776,9 @@ import { firebaseConfig } from "./firebase-config.js";
     li.appendChild(row);
 
     if (!isLeaf && !node.collapsed) {
+      var filler = document.createElement("span");
+      filler.className = "trunk-filler";
+      li.appendChild(filler);
       li.appendChild(renderNodeList(node.children));
     }
 
@@ -691,14 +844,14 @@ import { firebaseConfig } from "./firebase-config.js";
     if (cb) { toggleCompleted(cb.getAttribute("data-id"), cb.checked); return; }
   });
 
-  board.addEventListener("focusin", function (e) {
+  document.addEventListener("focusin", function (e) {
     var el = e.target.closest('[data-role="rename"]');
     if (!el) return;
     renameOriginalId = el.getAttribute("data-id");
     renameOriginalText = el.textContent;
   });
 
-  board.addEventListener("focusout", function (e) {
+  document.addEventListener("focusout", function (e) {
     var el = e.target.closest('[data-role="rename"]');
     if (!el) return;
     var id = el.getAttribute("data-id");
@@ -715,22 +868,25 @@ import { firebaseConfig } from "./firebase-config.js";
     flushPendingRemoteIfIdle();
   });
 
-  board.addEventListener("keydown", function (e) {
+  document.addEventListener("keydown", function (e) {
     var el = e.target.closest('[data-role="rename"]');
     if (!el) return;
     var id = el.getAttribute("data-id");
+    var isProjectRoot = state.projects.some(function (p) { return p.id === id; });
+    var isTreeRoot = !isProjectRoot && currentProject().trees.some(function (t) { return t.id === id; });
 
     if (e.key === "Enter" && e.shiftKey) {
-      // turn the current item into a branch and drop straight into its first child
+      // turn the current item into a branch and drop straight into its first child;
+      // on a project name, start a new board instead; on a board title, its first task
       e.preventDefault();
       el.blur();
-      addChild(id, true, "");
+      if (isProjectRoot) addTree();
+      else addChild(id, true, "");
     } else if (e.key === "Enter") {
       e.preventDefault();
-      var isTreeRoot = state.trees.some(function (t) { return t.id === id; });
       el.blur(); // commits the current name via the focusout handler
-      if (!isTreeRoot) addSiblingAfter(id);
-      // editing a board's own title just commits the rename - it doesn't create a task
+      if (!isTreeRoot && !isProjectRoot) addSiblingAfter(id);
+      // editing a project's or board's own title just commits the rename - it doesn't create a task
     } else if (e.key === "Escape") {
       e.preventDefault();
       if (id === pendingNewId) {
@@ -1027,6 +1183,8 @@ import { firebaseConfig } from "./firebase-config.js";
       closeConfirm();
     } else if (!detailsOverlay.hidden) {
       closeDetails();
+    } else if (!projectMenu.hidden) {
+      closeProjectMenu();
     }
   });
 
@@ -1035,16 +1193,15 @@ import { firebaseConfig } from "./firebase-config.js";
   document.getElementById("newTreeBtn").addEventListener("click", addTree);
   document.getElementById("emptyNewTreeBtn").addEventListener("click", addTree);
 
-  document.getElementById("exportBtn").addEventListener("click", function () {
-    var blob = new Blob([JSON.stringify(state, null, 2)], { type: "application/json" });
-    var url = URL.createObjectURL(blob);
-    var a = document.createElement("a");
-    a.href = url;
-    a.download = "tree-task-board-export.json";
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+  hamburgerBtn.addEventListener("click", function (e) {
+    e.stopPropagation();
+    if (projectMenu.hidden) openProjectMenu(); else closeProjectMenu();
+  });
+  addProjectBtn.addEventListener("click", addProject);
+  document.addEventListener("click", function (e) {
+    if (projectMenu.hidden) return;
+    if (projectMenu.contains(e.target) || e.target === hamburgerBtn) return;
+    closeProjectMenu();
   });
 
   var colorPickerInput = document.getElementById("colorPickerInput");
@@ -1056,33 +1213,6 @@ import { firebaseConfig } from "./firebase-config.js";
     found.node.color = colorPickerInput.value;
     saveState();
     render();
-  });
-
-  var importInput = document.getElementById("importInput");
-  document.getElementById("importBtn").addEventListener("click", function () {
-    importInput.value = "";
-    importInput.click();
-  });
-  importInput.addEventListener("change", function () {
-    var file = importInput.files[0];
-    if (!file) return;
-    var reader = new FileReader();
-    reader.onload = function () {
-      var parsed;
-      try {
-        parsed = JSON.parse(reader.result);
-        if (!parsed || !Array.isArray(parsed.trees)) throw new Error("Invalid file format");
-      } catch (err) {
-        alert("Could not import file: " + err.message);
-        return;
-      }
-      showConfirm("Importing will replace your current board. Continue?", function () {
-        state = parsed;
-        saveState();
-        render();
-      });
-    };
-    reader.readAsText(file);
   });
 
   // ---------- init ----------
