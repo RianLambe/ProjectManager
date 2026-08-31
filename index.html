@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Tree Task Board</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <h1>Tree Task Board</h1>
+    <div class="topbar-actions">
+      <span id="syncStatus" class="sync-status">Connecting...</span>
+      <button id="newTreeBtn" class="btn btn-primary">+ New Tree</button>
+      <button id="exportBtn" class="btn btn-ghost" title="Export board to a JSON file">Export</button>
+      <button id="importBtn" class="btn btn-ghost" title="Import board from a JSON file">Import</button>
+      <input type="file" id="importInput" accept="application/json" hidden>
+      <input type="color" id="colorPickerInput" hidden>
+    </div>
+  </header>
+
+  <main id="board" class="board">
+    <!-- tree cards get rendered here -->
+  </main>
+
+  <div id="emptyState" class="empty-state" hidden>
+    <p>No trees yet.</p>
+    <button id="emptyNewTreeBtn" class="btn btn-primary">Create your first tree</button>
+  </div>
+
+  <div id="detailsOverlay" class="details-overlay" hidden>
+    <div class="details-panel" role="dialog" aria-modal="true">
+      <div class="details-panel-top">
+        <div id="detailsBreadcrumb" class="details-breadcrumb"></div>
+        <button id="detailsClose" class="icon-btn" title="Close"></button>
+      </div>
+      <input id="detailsTitle" class="details-title-input" type="text" placeholder="Item name" spellcheck="false">
+      <div id="detailsMeta" class="details-meta"></div>
+      <label class="details-label" for="detailsNotes">Notes</label>
+      <textarea id="detailsNotes" class="details-notes" rows="6" placeholder="Add more details..."></textarea>
+      <div id="detailsChildren" class="details-children"></div>
+      <div class="details-actions">
+        <button id="detailsAddChild" class="btn btn-ghost">Add sub-item</button>
+        <button id="detailsDelete" class="btn btn-ghost danger">Delete</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="confirmOverlay" class="confirm-overlay" hidden>
+    <div class="confirm-panel" role="alertdialog" aria-modal="true">
+      <p id="confirmMessage" class="confirm-message"></p>
+      <div class="confirm-actions">
+        <button id="confirmCancelBtn" class="btn btn-ghost">Cancel</button>
+        <button id="confirmOkBtn" class="btn btn-danger">Delete</button>
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>
