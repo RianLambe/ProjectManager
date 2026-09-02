@@ -33,6 +33,11 @@ import { firebaseConfig } from "./firebase-config.js";
   var board = document.getElementById("board");
   var emptyState = document.getElementById("emptyState");
   var syncStatusEl = document.getElementById("syncStatus");
+  var loadingScreen = document.getElementById("loadingScreen");
+
+  function hideLoadingScreen() {
+    loadingScreen.classList.add("hidden");
+  }
   var projectNameEl = document.getElementById("projectName");
   var hamburgerBtn = document.getElementById("projectMenuBtn");
   var projectMenu = document.getElementById("projectMenu");
@@ -46,6 +51,7 @@ import { firebaseConfig } from "./firebase-config.js";
   var projectProgressLabel = document.getElementById("projectProgressLabel");
 
   var state = normalizeState(null);
+  var currentView = "project"; // "project" | "home" - which top-level screen is showing
   var focusRequest = null; // id of a node to focus+select after next render
   var dragId = null; // id of node currently being dragged
   var detailsId = null; // id of the node currently open in the details panel
@@ -259,6 +265,9 @@ import { firebaseConfig } from "./firebase-config.js";
       lastCheckpointState = deepClone(state);
       lastCheckpointTime = Date.now();
       historyBaselineSet = true;
+      hideLoadingScreen();
+      route(); // decide home vs. a specific project from the current URL
+      return;
     }
     render();
     if (detailsId) renderDetails();
@@ -316,6 +325,7 @@ import { firebaseConfig } from "./firebase-config.js";
         function (err) {
           console.error("Sync error", err);
           setSyncStatus("Sync error - working offline", "error");
+          hideLoadingScreen();
         }
       );
     });
@@ -323,6 +333,7 @@ import { firebaseConfig } from "./firebase-config.js";
     signInAnonymously(auth).catch(function (err) {
       console.error("Sign-in failed", err);
       setSyncStatus("Offline (sign-in failed)", "error");
+      hideLoadingScreen();
     });
   }
 
@@ -470,6 +481,8 @@ import { firebaseConfig } from "./firebase-config.js";
     var project = { id: uid(), name: "New Project", createdAt: Date.now(), trees: [] };
     state.projects.push(project);
     state.currentProjectId = project.id;
+    currentView = "project";
+    pushProjectUrl(project);
     focusRequest = project.id;
     pendingNewId = project.id;
     saveState();
@@ -479,13 +492,78 @@ import { firebaseConfig } from "./firebase-config.js";
 
   function switchProject(id) {
     closeProjectMenu();
-    if (id === state.currentProjectId) return;
-    var exists = state.projects.some(function (p) { return p.id === id; });
-    if (!exists) return;
+    var project = state.projects.filter(function (p) { return p.id === id; })[0];
+    if (!project) return;
+    if (id === state.currentProjectId && currentView === "project") return;
     state.currentProjectId = id;
+    currentView = "project";
+    pushProjectUrl(project);
     saveState();
     render();
   }
+
+  // ---------- routing (deep links: /<project name> jumps straight to it) ----------
+
+  // Spaces become hyphens for a cleaner URL than %20 - lossy if a name has
+  // its own literal hyphens, but fine for a personal app with a handful of
+  // projects; in-app navigation always regenerates the current slug anyway.
+  function slugifyName(name) {
+    return encodeURIComponent(name.trim().replace(/\s+/g, "-"));
+  }
+
+  function pushProjectUrl(project) {
+    history.pushState(null, "", "/" + slugifyName(project.name));
+  }
+
+  function pushHomeUrl() {
+    history.pushState(null, "", "/");
+  }
+
+  function projectNameFromPath() {
+    var path = window.location.pathname.replace(/^\/+|\/+$/g, "");
+    if (!path) return null;
+    try { path = decodeURIComponent(path); } catch (err) { /* keep as-is */ }
+    return path.replace(/-/g, " ");
+  }
+
+  function findProjectByName(name) {
+    return state.projects.filter(function (p) { return p.name === name; })[0] || null;
+  }
+
+  // Reads the current URL and shows whichever screen it points at - a known
+  // project's name, or the home list for anything else (including "/").
+  // Only meant to run once real project data has loaded.
+  function route() {
+    var name = projectNameFromPath();
+    var project = name ? findProjectByName(name) : null;
+    if (project) {
+      state.currentProjectId = project.id;
+      currentView = "project";
+    } else {
+      currentView = "home";
+    }
+    render();
+  }
+
+  function goHome() {
+    closeProjectMenu();
+    currentView = "home";
+    pushHomeUrl();
+    render();
+  }
+
+  function navigateToProject(project) {
+    state.currentProjectId = project.id;
+    currentView = "project";
+    pushProjectUrl(project);
+    saveState();
+    render();
+  }
+
+  window.addEventListener("popstate", function () {
+    if (!historyBaselineSet) return;
+    route();
+  });
 
   function deleteProject(id) {
     if (state.projects.length <= 1) return;
@@ -532,6 +610,28 @@ import { firebaseConfig } from "./firebase-config.js";
       row.appendChild(nameBtn);
 
       projectMenuList.appendChild(row);
+    });
+  }
+
+  function renderProjectHome() {
+    var container = document.getElementById("projectHomeList");
+    if (!container) return;
+    container.innerHTML = "";
+    state.projects.forEach(function (p) {
+      var row = document.createElement("button");
+      row.className = "project-home-row";
+
+      var nameSpan = document.createElement("span");
+      nameSpan.textContent = p.name;
+      row.appendChild(nameSpan);
+
+      var countSpan = document.createElement("span");
+      countSpan.className = "project-home-count";
+      countSpan.textContent = p.trees.length + (p.trees.length === 1 ? " board" : " boards");
+      row.appendChild(countSpan);
+
+      row.addEventListener("click", function () { navigateToProject(p); });
+      container.appendChild(row);
     });
   }
 
@@ -879,6 +979,14 @@ import { firebaseConfig } from "./firebase-config.js";
   // ---------- rendering ----------
 
   function render() {
+    document.body.classList.toggle("home-view", currentView === "home");
+    renderProjectHome();
+    if (currentView === "home") {
+      document.title = "All Projects";
+      maybeCheckpoint();
+      return;
+    }
+
     var project = currentProject();
 
     projectNameEl.textContent = project.name;
@@ -2258,6 +2366,8 @@ import { firebaseConfig } from "./firebase-config.js";
     if (projectMenu.hidden) openProjectMenu(); else closeProjectMenu();
   });
   addProjectBtn.addEventListener("click", addProject);
+  document.getElementById("projectMenuHomeBtn").addEventListener("click", goHome);
+  document.getElementById("projectHomeNewBtn").addEventListener("click", addProject);
   document.addEventListener("click", function (e) {
     if (projectMenu.hidden) return;
     if (projectMenu.contains(e.target) || e.target === hamburgerBtn) return;
@@ -2279,4 +2389,7 @@ import { firebaseConfig } from "./firebase-config.js";
 
   render();
   initFirebaseSync();
+  // Safety net: don't leave the user staring at "Connecting..." forever if
+  // something hangs in a way the error handlers above don't catch.
+  setTimeout(hideLoadingScreen, 8000);
 })();

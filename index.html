@@ -7,10 +7,18 @@
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
+  <div id="loadingScreen" class="loading-screen">
+    <div class="loading-spinner"></div>
+    <div class="loading-text">Connecting...</div>
+  </div>
+
   <header class="topbar">
-    <div class="project-switcher">
+    <div id="topbarProjectView" class="project-switcher">
       <button id="projectMenuBtn" class="icon-btn hamburger-btn" title="Switch project"></button>
       <span id="projectName" class="project-name" contenteditable="true" spellcheck="false" data-role="rename"></span>
+    </div>
+    <div id="topbarHomeView" class="project-switcher" hidden>
+      <span class="project-name">All Projects</span>
     </div>
     <div class="topbar-actions">
       <span id="syncStatus" class="sync-status">Connecting...</span>
@@ -21,9 +29,16 @@
   </header>
 
   <div id="projectMenu" class="project-menu" hidden>
+    <button id="projectMenuHomeBtn" class="btn btn-ghost project-menu-home">All Projects</button>
     <div id="projectMenuList" class="project-menu-list"></div>
     <button id="addProjectBtn" class="btn btn-ghost project-menu-add">+ New Project</button>
   </div>
+
+  <section id="projectHome" class="project-home" hidden>
+    <h1 class="project-home-title">Your Projects</h1>
+    <div id="projectHomeList" class="project-home-list"></div>
+    <button id="projectHomeNewBtn" class="btn btn-primary">+ New Project</button>
+  </section>
 
   <section id="projectProgress" class="project-progress">
     <div class="project-progress-bar"><div id="projectProgressFill" class="project-progress-fill"></div></div>
