@@ -25,6 +25,11 @@
     <button id="addProjectBtn" class="btn btn-ghost project-menu-add">+ New Project</button>
   </div>
 
+  <section id="projectProgress" class="project-progress">
+    <div class="project-progress-bar"><div id="projectProgressFill" class="project-progress-fill"></div></div>
+    <span id="projectProgressLabel" class="project-progress-label"></span>
+  </section>
+
   <section id="dashboard" class="dashboard">
     <button id="priorityBtn" class="btn btn-ghost dash-btn"></button>
     <button id="unblockedBtn" class="btn btn-ghost dash-btn"></button>
@@ -46,11 +51,24 @@
         <div id="detailsBreadcrumb" class="details-breadcrumb"></div>
         <button id="detailsClose" class="icon-btn" title="Close"></button>
       </div>
-      <input id="detailsTitle" class="details-title-input" type="text" placeholder="Item name" spellcheck="false">
+      <div class="details-title-row">
+        <input id="detailsTitle" class="details-title-input" type="text" placeholder="Item name" spellcheck="false">
+        <button id="detailsPriorityBtn" class="icon-btn priority-star" title="Mark as priority"></button>
+      </div>
       <div id="detailsMeta" class="details-meta"></div>
       <div id="detailsDeps" class="details-deps"></div>
+      <label class="details-label">Tags</label>
+      <div id="detailsTags" class="details-tags"></div>
       <label class="details-label" for="detailsNotes">Notes</label>
       <textarea id="detailsNotes" class="details-notes" rows="6" placeholder="Add more details..."></textarea>
+      <label class="details-label">Images</label>
+      <div id="detailsImages" class="details-images"></div>
+      <input type="file" id="imageInput" accept="image/*" hidden>
+      <div class="details-image-actions">
+        <button id="addImageBtn" class="btn btn-ghost">+ Add image</button>
+        <span class="details-image-hint">or paste an image (Ctrl+V)</span>
+      </div>
+      <div id="imageUploadError" class="details-image-error" hidden></div>
       <div id="detailsChildren" class="details-children"></div>
       <div class="details-actions">
         <button id="detailsAddChild" class="btn btn-ghost">Add sub-item</button>
@@ -75,7 +93,30 @@
         <h2 id="dashFullTitle" class="timeline-title">Priority</h2>
         <button id="dashFullClose" class="icon-btn" title="Close"></button>
       </div>
+      <select id="dashFullTagFilter" class="dash-full-tag-filter" hidden></select>
       <div id="dashFullList" class="dash-list dash-full-list"></div>
+    </div>
+  </div>
+
+  <div id="lightboxOverlay" class="details-overlay lightbox-overlay" hidden>
+    <button id="lightboxClose" class="icon-btn lightbox-close" title="Close"></button>
+    <button id="lightboxPrev" class="lightbox-nav lightbox-prev" title="Previous"></button>
+    <img id="lightboxImg" class="lightbox-img" alt="">
+    <button id="lightboxNext" class="lightbox-nav lightbox-next" title="Next"></button>
+    <div id="lightboxCounter" class="lightbox-counter"></div>
+  </div>
+
+  <div id="tagPickerOverlay" class="confirm-overlay" hidden>
+    <div class="confirm-panel tag-picker-panel">
+      <p id="tagPickerTitle" class="confirm-message"></p>
+      <div id="tagPickerList" class="tag-picker-list"></div>
+      <div class="tag-picker-new-row">
+        <button id="tagPickerNewBtn" class="tag-new-btn">+ New tag</button>
+        <input type="text" id="tagPickerInput" class="tag-input" placeholder="tag name" hidden>
+      </div>
+      <div class="confirm-actions">
+        <button id="tagPickerCancelBtn" class="btn btn-ghost">Cancel</button>
+      </div>
     </div>
   </div>
 

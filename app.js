@@ -18,6 +18,13 @@ import {
   signInAnonymously,
   onAuthStateChanged
 } from "https://www.gstatic.com/firebasejs/12.18.0/firebase-auth.js";
+import {
+  getStorage,
+  ref as storageRef,
+  uploadBytes,
+  getDownloadURL,
+  deleteObject
+} from "https://www.gstatic.com/firebasejs/12.18.0/firebase-storage.js";
 import { firebaseConfig } from "./firebase-config.js";
 
 (function () {
@@ -35,6 +42,8 @@ import { firebaseConfig } from "./firebase-config.js";
   var priorityBtn = document.getElementById("priorityBtn");
   var unblockedBtn = document.getElementById("unblockedBtn");
   var lockedBtn = document.getElementById("lockedBtn");
+  var projectProgressFill = document.getElementById("projectProgressFill");
+  var projectProgressLabel = document.getElementById("projectProgressLabel");
 
   var state = normalizeState(null);
   var focusRequest = null; // id of a node to focus+select after next render
@@ -43,8 +52,16 @@ import { firebaseConfig } from "./firebase-config.js";
   var pendingNewId = null; // id of a just-created, not-yet-named node/tree - discarded if left empty
   var renameOriginalId = null; // id of the node currently being renamed
   var renameOriginalText = null; // its text when editing started, restored on Escape
-  var caretClickTimer = null; // used to tell a single click on a caret apart from a double click
-  var nodeClickTimer = null; // used to tell a single click on a task apart from a double click
+  // Per-id (not shared) so clicking around quickly on different rows/carets
+  // doesn't cancel another item's still-pending single-click action - each
+  // item gets its own 250ms single/double-click pairing. Deliberately NOT
+  // based on the browser's own e.detail (which just keeps counting up for
+  // every rapid click in the same spot, 3, 4, 5...) - instead each timer
+  // handle IS the "click 1 is waiting" flag: a second click while it's still
+  // set consumes it and fires the double-click action, then clears it, so
+  // the next click starts a fresh pair. 4 clicks -> 2 double-click actions.
+  var caretClickTimers = {}; // used to tell a single click on a caret apart from a double click
+  var rowClickTimers = {}; // used to tell a single click on a task/board header apart from a double click
 
   var ICONS = {
     caret: '<svg viewBox="0 0 24 24" width="12" height="12"><path d="M6 9l6 6 6-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>',
@@ -64,6 +81,7 @@ import { firebaseConfig } from "./firebase-config.js";
 
   var boardDocRef = null;
   var historyCollectionRef = null;
+  var storage = null;
   var saveTimer = null;
   var pendingRemoteState = null; // a remote update that arrived while the user was mid-edit
   var hasPendingWrite = false; // true from the moment a local change happens until it's confirmed saved
@@ -207,6 +225,7 @@ import { firebaseConfig } from "./firebase-config.js";
     if (!active) return false;
     if (active.getAttribute && active.getAttribute("data-role") === "rename") return true;
     if (active.id === "detailsTitle" || active.id === "detailsNotes") return true;
+    if (active.classList && active.classList.contains("tag-input")) return true;
     return false;
   }
 
@@ -267,6 +286,7 @@ import { firebaseConfig } from "./firebase-config.js";
     var db = getFirestore(app);
     boardDocRef = doc(db, "boards", "main");
     historyCollectionRef = collection(db, "boards", "main", "history");
+    storage = getStorage(app);
 
     enableIndexedDbPersistence(db).catch(function () {
       // fails silently in unsupported browsers or with multiple tabs open;
@@ -339,6 +359,8 @@ import { firebaseConfig } from "./firebase-config.js";
       notes: "",
       priority: false,
       blockedBy: null,
+      images: [],
+      tags: [],
       createdAt: Date.now(),
       children: []
     };
@@ -513,13 +535,30 @@ import { firebaseConfig } from "./firebase-config.js";
     });
   }
 
+  // Any modal/overlay calls these on open/close. A counter (not a plain flag)
+  // so one overlay opening on top of another - e.g. the lightbox from within
+  // the details panel - doesn't unlock the background the moment the inner
+  // one closes while the outer one is still up.
+  var openOverlayCount = 0;
+  function lockBodyScroll() {
+    openOverlayCount++;
+    document.body.classList.add("modal-open");
+  }
+  function unlockBodyScroll() {
+    openOverlayCount = Math.max(0, openOverlayCount - 1);
+    if (openOverlayCount === 0) document.body.classList.remove("modal-open");
+  }
+
   function openProjectMenu() {
     renderProjectMenu();
     projectMenu.hidden = false;
+    lockBodyScroll();
   }
 
   function closeProjectMenu() {
+    if (projectMenu.hidden) return;
     projectMenu.hidden = true;
+    unlockBodyScroll();
   }
 
   // Removes a node with no confirmation dialog - used to silently discard a
@@ -536,21 +575,35 @@ import { firebaseConfig } from "./firebase-config.js";
   // forcing every descendant to match one new state - a branch that was
   // already expanded while its sibling was collapsed keeps that difference,
   // it just each flips to the opposite of whatever it currently was.
-  function toggleCollapsedDeep(node) {
-    node.collapsed = !node.collapsed;
+  function setCollapsedDeep(node, value) {
+    node.collapsed = value;
     for (var i = 0; i < node.children.length; i++) {
-      if (node.children[i].children.length > 0) toggleCollapsedDeep(node.children[i]);
+      if (node.children[i].children.length > 0) setCollapsedDeep(node.children[i], value);
     }
   }
 
-  // Toggles every descendant's own collapsed flag, but leaves the clicked
-  // branch's own state exactly as it was - only its children (and further
-  // down) are affected.
+  // True if any branch anywhere below this node is currently collapsed.
+  function anyCollapsedDeep(node) {
+    for (var i = 0; i < node.children.length; i++) {
+      var child = node.children[i];
+      if (child.children.length === 0) continue;
+      if (child.collapsed) return true;
+      if (anyCollapsedDeep(child)) return true;
+    }
+    return false;
+  }
+
+  // Expands or collapses every branch below the clicked one, all the way
+  // down - not just its direct children - leaving the clicked branch's own
+  // state exactly as it was. If anything below is still collapsed, this
+  // expands everything; only once it's all already expanded does it collapse
+  // everything, so repeated clicks alternate cleanly between the two.
   function toggleCollapseRecursive(id) {
     var found = findNode(id);
     if (!found) return;
+    var target = !anyCollapsedDeep(found.node);
     for (var i = 0; i < found.node.children.length; i++) {
-      if (found.node.children[i].children.length > 0) toggleCollapsedDeep(found.node.children[i]);
+      if (found.node.children[i].children.length > 0) setCollapsedDeep(found.node.children[i], target);
     }
     saveState();
     render();
@@ -645,6 +698,102 @@ import { firebaseConfig } from "./firebase-config.js";
     render();
   }
 
+  function addTag(id, tag) {
+    var found = findNode(id);
+    if (!found) return;
+    var trimmed = (tag || "").trim();
+    if (!trimmed) return;
+    if (!found.node.tags) found.node.tags = [];
+    if (found.node.tags.indexOf(trimmed) === -1) found.node.tags.push(trimmed);
+    saveState();
+    render();
+    if (detailsId === id) renderDetails();
+  }
+
+  function removeTag(id, tag) {
+    var found = findNode(id);
+    if (!found || !found.node.tags) return;
+    found.node.tags = found.node.tags.filter(function (t) { return t !== tag; });
+    saveState();
+    render();
+    if (detailsId === id) renderDetails();
+  }
+
+  function allProjectTags(project) {
+    var set = {};
+    flattenProjectNodes(project).forEach(function (item) {
+      (item.node.tags || []).forEach(function (t) { set[t] = true; });
+    });
+    return Object.keys(set).sort();
+  }
+
+  function addTagToNodeObj(node, tag) {
+    if (!node.tags) node.tags = [];
+    if (node.tags.indexOf(tag) === -1) node.tags.push(tag);
+  }
+
+  function tagAllChildren(id, tag) {
+    var found = findNode(id);
+    if (!found) return;
+    var trimmed = (tag || "").trim();
+    if (!trimmed) return;
+    (function walk(node) {
+      node.children.forEach(function (child) {
+        addTagToNodeObj(child, trimmed);
+        walk(child);
+      });
+    })(found.node);
+    saveState();
+    render();
+    if (detailsId === id) renderDetails();
+  }
+
+  function tagImmediateChildren(id, tag) {
+    var found = findNode(id);
+    if (!found) return;
+    var trimmed = (tag || "").trim();
+    if (!trimmed) return;
+    found.node.children.forEach(function (child) { addTagToNodeObj(child, trimmed); });
+    saveState();
+    render();
+    if (detailsId === id) renderDetails();
+  }
+
+  function uploadImage(nodeId, file) {
+    if (!storage) return;
+    var path = "task-images/" + nodeId + "/" + uid() + "-" + file.name;
+    var fileRef = storageRef(storage, path);
+    uploadBytes(fileRef, file)
+      .then(function () { return getDownloadURL(fileRef); })
+      .then(function (url) {
+        var fresh = findNode(nodeId);
+        if (!fresh) return;
+        if (!fresh.node.images) fresh.node.images = [];
+        fresh.node.images.push({ id: uid(), url: url, path: path, createdAt: Date.now() });
+        saveState();
+        render();
+        if (detailsId === nodeId) renderDetails();
+      })
+      .catch(function (err) {
+        console.error("Image upload failed", err);
+        if (detailsId === nodeId) showImageError(err.message);
+      });
+  }
+
+  function deleteImage(nodeId, imageId) {
+    var found = findNode(nodeId);
+    if (!found || !found.node.images) return;
+    var img = found.node.images.filter(function (i) { return i.id === imageId; })[0];
+    if (!img) return;
+    found.node.images = found.node.images.filter(function (i) { return i.id !== imageId; });
+    saveState();
+    render();
+    if (detailsId === nodeId) renderDetails();
+    if (storage && img.path) {
+      deleteObject(storageRef(storage, img.path)).catch(function () {});
+    }
+  }
+
   function renameNode(id, newName) {
     var found = findNode(id);
     if (!found) return;
@@ -736,6 +885,7 @@ import { firebaseConfig } from "./firebase-config.js";
     projectNameEl.setAttribute("data-id", project.id);
     document.title = project.name;
 
+    renderProjectProgress(project);
     renderDashboard(project);
 
     board.innerHTML = "";
@@ -746,12 +896,29 @@ import { firebaseConfig } from "./firebase-config.js";
     if (focusRequest) {
       var toFocus = document.querySelector('[data-id="' + cssEscape(focusRequest) + '"] > .node-row > .node-main > .node-label-wrap > .node-name, [data-tree-id="' + cssEscape(focusRequest) + '"] .tree-name, #projectName[data-id="' + cssEscape(focusRequest) + '"]');
       if (toFocus) {
+        if (toFocus.classList.contains("node-name") || toFocus.classList.contains("tree-name")) {
+          toFocus.contentEditable = "true";
+        }
         toFocus.focus();
         selectAllText(toFocus);
       }
       focusRequest = null;
     }
     maybeCheckpoint();
+  }
+
+  // Rolls up every board's progress into one project-wide total.
+  function renderProjectProgress(project) {
+    var done = 0, total = 0;
+    project.trees.forEach(function (tree) {
+      var p = computeProgress(tree);
+      done += p.done;
+      total += p.total;
+    });
+    var pct = total > 0 ? Math.round((done / total) * 100) : 0;
+    projectProgressFill.style.width = pct + "%";
+    projectProgressLabel.textContent = pct + "% (" + done + "/" + total + ")";
+    projectProgressLabel.className = "project-progress-label " + pctColorClass(pct);
   }
 
   // Priority = flagged and not done yet. Unblocked = actionable - not done,
@@ -801,6 +968,18 @@ import { firebaseConfig } from "./firebase-config.js";
     nameBtn.appendChild(document.createTextNode(item.name));
     nameBtn.addEventListener("click", function () { closeDashFull(); openDetails(item.id); });
     row.appendChild(nameBtn);
+
+    if (item.node.tags && item.node.tags.length > 0) {
+      var tagsWrap = document.createElement("span");
+      tagsWrap.className = "dash-row-tags";
+      item.node.tags.forEach(function (t) {
+        var chip = document.createElement("span");
+        chip.className = "tag-chip-mini";
+        chip.textContent = t;
+        tagsWrap.appendChild(chip);
+      });
+      row.appendChild(tagsWrap);
+    }
 
     return row;
   }
@@ -868,7 +1047,7 @@ import { firebaseConfig } from "./firebase-config.js";
 
     var nameSpan = document.createElement("span");
     nameSpan.className = "tree-name";
-    nameSpan.contentEditable = "true";
+    nameSpan.contentEditable = "false";
     nameSpan.spellcheck = false;
     nameSpan.textContent = tree.name;
     nameSpan.setAttribute("data-id", tree.id);
@@ -888,17 +1067,18 @@ import { firebaseConfig } from "./firebase-config.js";
     deleteBtn.setAttribute("data-role", "delete-tree");
     deleteBtn.innerHTML = ICONS.trash;
 
-    var headerCircle = document.createElement("span");
-    headerCircle.className = "header-circle";
-    top.appendChild(headerCircle);
-    top.appendChild(nameSpan);
+    top.appendChild(colorBtn);
+
+    var nameWrap = document.createElement("div");
+    nameWrap.className = "tree-name-wrap";
+    nameWrap.appendChild(nameSpan);
     if (tree.notes && tree.notes.trim()) {
       var treeNotesDot = document.createElement("span");
       treeNotesDot.className = "notes-dot";
       treeNotesDot.title = "Has notes";
-      top.appendChild(treeNotesDot);
+      nameWrap.appendChild(treeNotesDot);
     }
-    top.appendChild(colorBtn);
+    top.appendChild(nameWrap);
     top.appendChild(deleteBtn);
     header.appendChild(top);
 
@@ -991,20 +1171,20 @@ import { firebaseConfig } from "./firebase-config.js";
 
     var nameSpan = document.createElement("span");
     nameSpan.className = "node-name";
-    nameSpan.contentEditable = "true";
+    nameSpan.contentEditable = "false";
     nameSpan.spellcheck = false;
     nameSpan.textContent = node.name;
     nameSpan.setAttribute("data-id", node.id);
     nameSpan.setAttribute("data-role", "rename");
     labelWrap.appendChild(nameSpan);
 
-    var starBtn = document.createElement("button");
-    starBtn.className = "icon-btn priority-star" + (node.priority ? " active" : "");
-    starBtn.title = node.priority ? "Remove priority" : "Mark as priority";
-    starBtn.innerHTML = ICONS.star;
-    starBtn.setAttribute("data-id", node.id);
-    starBtn.setAttribute("data-role", "toggle-priority");
-    labelWrap.appendChild(starBtn);
+    if (node.priority) {
+      var starBadge = document.createElement("span");
+      starBadge.className = "priority-star-badge";
+      starBadge.title = "Priority";
+      starBadge.innerHTML = ICONS.star;
+      labelWrap.appendChild(starBadge);
+    }
 
     if (blocked) {
       var lockIcon = document.createElement("span");
@@ -1012,13 +1192,6 @@ import { firebaseConfig } from "./firebase-config.js";
       lockIcon.title = 'Blocked by "' + blockerFound.node.name + '"';
       lockIcon.innerHTML = ICONS.lock;
       labelWrap.appendChild(lockIcon);
-    }
-
-    if (node.notes && node.notes.trim()) {
-      var notesDot = document.createElement("span");
-      notesDot.className = "notes-dot";
-      notesDot.title = "Has notes";
-      labelWrap.appendChild(notesDot);
     }
 
     if (!isLeaf) {
@@ -1074,22 +1247,24 @@ import { firebaseConfig } from "./firebase-config.js";
     if (toggle) {
       var toggleId = toggle.getAttribute("data-id");
       if (e.shiftKey) {
-        clearTimeout(caretClickTimer);
+        clearTimeout(caretClickTimers[toggleId]);
+        caretClickTimers[toggleId] = null;
         toggleCollapseRecursive(toggleId);
-      } else if (e.detail >= 2) {
-        clearTimeout(caretClickTimer);
+      } else if (caretClickTimers[toggleId]) {
+        // a first click is already waiting on this caret - this is its pair
+        clearTimeout(caretClickTimers[toggleId]);
+        caretClickTimers[toggleId] = null;
         toggleCollapseRecursive(toggleId);
       } else {
         // delay a plain single click briefly in case a second click follows,
         // so a double-click doesn't also fire (and flicker) a single toggle
-        clearTimeout(caretClickTimer);
-        caretClickTimer = setTimeout(function () { toggleCollapse(toggleId); }, 250);
+        caretClickTimers[toggleId] = setTimeout(function () {
+          caretClickTimers[toggleId] = null;
+          toggleCollapse(toggleId);
+        }, 250);
       }
       return;
     }
-
-    var starToggle = e.target.closest('[data-role="toggle-priority"]');
-    if (starToggle) { togglePriority(starToggle.getAttribute("data-id")); return; }
 
     var addChildBtn = e.target.closest('[data-role="add-child"]');
     if (addChildBtn) { addChild(addChildBtn.getAttribute("data-id")); return; }
@@ -1112,38 +1287,79 @@ import { firebaseConfig } from "./firebase-config.js";
 
     if (e.target.closest('[data-role="toggle-complete"]')) return;
 
-    // a task row is one button: a single click opens its details, a double
-    // click renames it - same single/double debounce trick as the caret above
+    // a task row is one button: a single click opens its details,
+    // shift-click or double-click expands/collapses everything under a
+    // branch row (same as a board header) - except a double-click landing
+    // directly on the name text renames it instead. A leaf row has nothing
+    // to expand, so a double-click anywhere on it always renames.
     var row = e.target.closest(".node-row");
     if (row) {
       var rowId = row.getAttribute("data-id");
-      if (e.detail >= 2) {
-        clearTimeout(nodeClickTimer);
-        var nameEl = row.querySelector(".node-name");
-        if (nameEl) { nameEl.focus(); selectAllText(nameEl); }
+      var isBranchRow = !!row.querySelector(':scope > [data-role="toggle-collapse"]');
+      var onNodeName = !!e.target.closest(".node-name");
+
+      if (isBranchRow && e.shiftKey) {
+        clearTimeout(rowClickTimers[rowId]);
+        rowClickTimers[rowId] = null;
+        toggleCollapseRecursive(rowId);
+      } else if (rowClickTimers[rowId]) {
+        // a first click is already waiting on this row - this is its pair
+        clearTimeout(rowClickTimers[rowId]);
+        rowClickTimers[rowId] = null;
+        if (isBranchRow && !onNodeName) {
+          toggleCollapseRecursive(rowId);
+        } else {
+          var nameEl = row.querySelector(".node-name");
+          if (nameEl) { nameEl.contentEditable = "true"; nameEl.focus(); selectAllText(nameEl); }
+        }
       } else {
-        clearTimeout(nodeClickTimer);
-        nodeClickTimer = setTimeout(function () { openDetails(rowId); }, 250);
+        rowClickTimers[rowId] = setTimeout(function () {
+          rowClickTimers[rowId] = null;
+          openDetails(rowId);
+        }, 250);
       }
       return;
     }
 
-    // board header title keeps its old behavior: click the name to rename it
-    if (e.target.closest('[data-role="rename"]')) return;
-
+    // a board header is one button too: single click opens its details,
+    // shift-click or double-click expands/collapses everything in the board
+    // (same as a task row's caret) - except a double-click landing directly
+    // on the name text renames it instead
     var headerHit = e.target.closest(".tree-card-header-top") || e.target.closest(".tree-progress-wrap");
     if (headerHit) {
       var card = e.target.closest(".tree-card");
-      if (card) openDetails(card.getAttribute("data-tree-id"));
+      if (!card) return;
+      var treeId = card.getAttribute("data-tree-id");
+      var onName = !!e.target.closest(".tree-name");
+      if (e.shiftKey) {
+        clearTimeout(rowClickTimers[treeId]);
+        rowClickTimers[treeId] = null;
+        toggleCollapseRecursive(treeId);
+      } else if (rowClickTimers[treeId]) {
+        // a first click is already waiting on this header - this is its pair
+        clearTimeout(rowClickTimers[treeId]);
+        rowClickTimers[treeId] = null;
+        if (onName) {
+          var treeNameEl = card.querySelector(".tree-name");
+          if (treeNameEl) { treeNameEl.contentEditable = "true"; treeNameEl.focus(); selectAllText(treeNameEl); }
+        } else {
+          toggleCollapseRecursive(treeId);
+        }
+      } else {
+        rowClickTimers[treeId] = setTimeout(function () {
+          rowClickTimers[treeId] = null;
+          openDetails(treeId);
+        }, 250);
+      }
     }
   });
 
-  // Stops a plain click on a task's name from immediately focusing it for
-  // editing (its default behavior as a contenteditable element) - renaming a
-  // task now only starts on a double click, handled explicitly in the click
-  // listener below.
+  // Stops a plain click on a task's or board's name from immediately
+  // focusing it for editing (its default behavior as a contenteditable
+  // element) - renaming now only starts on a double click, handled
+  // explicitly in the click listener below.
   board.addEventListener("mousedown", function (e) {
-    if (e.target.closest(".node-name")) e.preventDefault();
+    if (e.target.closest(".node-name") || e.target.closest(".tree-name")) e.preventDefault();
   });
 
   board.addEventListener("change", function (e) {
@@ -1219,9 +1435,20 @@ import { firebaseConfig } from "./firebase-config.js";
 
   board.addEventListener("dragend", function () {
     dragId = null;
-    var overs = board.querySelectorAll(".drag-over, .drag-over-root");
-    for (var i = 0; i < overs.length; i++) overs[i].classList.remove("drag-over", "drag-over-root");
+    clearDragOverClasses();
   });
+
+  // Top third of the row = drop before it, bottom third = drop after it
+  // (reordering as a sibling), middle third = drop into it (new sub-task).
+  function dropPositionFor(li, clientY) {
+    var row = li.querySelector(":scope > .node-row");
+    var rect = row.getBoundingClientRect();
+    var offsetY = clientY - rect.top;
+    var third = rect.height / 3;
+    if (offsetY < third) return "before";
+    if (offsetY > third * 2) return "after";
+    return "into";
+  }
 
   board.addEventListener("dragover", function (e) {
     if (!dragId) return;
@@ -1229,8 +1456,11 @@ import { firebaseConfig } from "./firebase-config.js";
     if (li) {
       e.preventDefault();
       e.dataTransfer.dropEffect = "move";
+      var position = dropPositionFor(li, e.clientY);
       clearDragOverClasses();
-      li.classList.add("drag-over");
+      if (position === "into") li.classList.add("drag-over");
+      else if (position === "before") li.classList.add("drag-over-before");
+      else li.classList.add("drag-over-after");
       return;
     }
     var rootBody = e.target.closest('[data-role="root-body"]');
@@ -1248,14 +1478,7 @@ import { firebaseConfig } from "./firebase-config.js";
     if (li) {
       e.preventDefault();
       var targetId = li.getAttribute("data-id");
-      var row = li.querySelector(":scope > .node-row");
-      var rect = row.getBoundingClientRect();
-      var offsetY = e.clientY - rect.top;
-      var third = rect.height / 3;
-      var position;
-      if (offsetY < third) position = "before";
-      else if (offsetY > third * 2) position = "after";
-      else position = "into";
+      var position = dropPositionFor(li, e.clientY);
       moveNode(dragId, targetId, position);
       clearDragOverClasses();
       return;
@@ -1269,8 +1492,10 @@ import { firebaseConfig } from "./firebase-config.js";
   });
 
   function clearDragOverClasses() {
-    var overs = board.querySelectorAll(".drag-over, .drag-over-root");
-    for (var i = 0; i < overs.length; i++) overs[i].classList.remove("drag-over", "drag-over-root");
+    var overs = board.querySelectorAll(".drag-over, .drag-over-before, .drag-over-after, .drag-over-root");
+    for (var i = 0; i < overs.length; i++) {
+      overs[i].classList.remove("drag-over", "drag-over-before", "drag-over-after", "drag-over-root");
+    }
   }
 
   // ---------- details panel ----------
@@ -1280,21 +1505,36 @@ import { firebaseConfig } from "./firebase-config.js";
   var detailsClose = document.getElementById("detailsClose");
   var detailsBreadcrumb = document.getElementById("detailsBreadcrumb");
   var detailsTitle = document.getElementById("detailsTitle");
+  var detailsPriorityBtn = document.getElementById("detailsPriorityBtn");
   var detailsMeta = document.getElementById("detailsMeta");
   var detailsDeps = document.getElementById("detailsDeps");
+  var detailsTags = document.getElementById("detailsTags");
   var detailsNotes = document.getElementById("detailsNotes");
+  var detailsImages = document.getElementById("detailsImages");
+  var addImageBtn = document.getElementById("addImageBtn");
+  var imageInput = document.getElementById("imageInput");
+  var imageUploadError = document.getElementById("imageUploadError");
+
+  function showImageError(message) {
+    imageUploadError.textContent = "Image upload failed: " + message;
+    imageUploadError.hidden = false;
+  }
   var detailsChildren = document.getElementById("detailsChildren");
   var detailsAddChildBtn = document.getElementById("detailsAddChild");
   var detailsDeleteBtn = document.getElementById("detailsDelete");
 
   detailsClose.innerHTML = ICONS.close;
+  detailsPriorityBtn.innerHTML = ICONS.star;
+  detailsPriorityBtn.addEventListener("click", function () { togglePriority(detailsId); });
 
   function openDetails(id, focusTitle) {
     var found = findNode(id);
     if (!found) return;
+    var wasHidden = detailsOverlay.hidden;
     detailsId = id;
     renderDetails();
     detailsOverlay.hidden = false;
+    if (wasHidden) lockBodyScroll();
     if (focusTitle) {
       detailsTitle.focus();
       detailsTitle.select();
@@ -1302,8 +1542,10 @@ import { firebaseConfig } from "./firebase-config.js";
   }
 
   function closeDetails() {
+    if (detailsOverlay.hidden) return;
     detailsId = null;
     detailsOverlay.hidden = true;
+    unlockBodyScroll();
   }
 
   function renderDetails() {
@@ -1362,27 +1604,11 @@ import { firebaseConfig } from "./firebase-config.js";
       detailsMeta.appendChild(progDiv);
     }
 
-    if (node.createdAt) {
-      var created = document.createElement("div");
-      created.className = "details-meta-created";
-      created.textContent = "Created " + new Date(node.createdAt).toLocaleDateString();
-      detailsMeta.appendChild(created);
-    }
-
     // priority + blocked-by
     detailsDeps.innerHTML = "";
 
-    var priorityLabel = document.createElement("label");
-    priorityLabel.className = "details-priority-toggle";
-    var priorityCb = document.createElement("input");
-    priorityCb.type = "checkbox";
-    priorityCb.checked = !!node.priority;
-    priorityCb.addEventListener("change", function () { togglePriority(node.id); });
-    var prioritySpan = document.createElement("span");
-    prioritySpan.textContent = "Priority";
-    priorityLabel.appendChild(priorityCb);
-    priorityLabel.appendChild(prioritySpan);
-    detailsDeps.appendChild(priorityLabel);
+    detailsPriorityBtn.className = "icon-btn priority-star" + (node.priority ? " active" : "");
+    detailsPriorityBtn.title = node.priority ? "Remove priority" : "Mark as priority";
 
     var blockedLabelEl = document.createElement("label");
     blockedLabelEl.className = "details-label";
@@ -1422,6 +1648,102 @@ import { firebaseConfig } from "./firebase-config.js";
       blockedNote.textContent = 'Blocked until "' + findNode(node.blockedBy).node.name + '" is done.';
       detailsDeps.appendChild(blockedNote);
     }
+
+    // tags
+    detailsTags.innerHTML = "";
+    (node.tags || []).forEach(function (tag) {
+      var chip = document.createElement("span");
+      chip.className = "tag-chip";
+      chip.appendChild(document.createTextNode(tag));
+      var rm = document.createElement("button");
+      rm.className = "tag-chip-remove";
+      rm.innerHTML = ICONS.close;
+      rm.title = "Remove tag";
+      rm.addEventListener("click", function () { removeTag(node.id, tag); });
+      chip.appendChild(rm);
+      detailsTags.appendChild(chip);
+    });
+    if (isLeaf) {
+      var availableTags = allProjectTags(currentProject()).filter(function (t) {
+        return (node.tags || []).indexOf(t) === -1;
+      });
+      availableTags.forEach(function (t) {
+        var addBtn = document.createElement("button");
+        addBtn.className = "tag-chip tag-chip-add";
+        addBtn.textContent = t;
+        addBtn.title = "Add tag";
+        addBtn.addEventListener("click", function () { addTag(node.id, t); });
+        detailsTags.appendChild(addBtn);
+      });
+
+      var tagInput = document.createElement("input");
+      tagInput.type = "text";
+      tagInput.className = "tag-input";
+      tagInput.placeholder = "tag name";
+      tagInput.hidden = true;
+      tagInput.addEventListener("keydown", function (e) {
+        if (e.key === "Enter") {
+          e.preventDefault();
+          addTag(node.id, tagInput.value);
+          tagInput.value = "";
+        }
+      });
+
+      var newTagBtn = document.createElement("button");
+      newTagBtn.className = "tag-new-btn";
+      newTagBtn.textContent = "+ New tag";
+      newTagBtn.addEventListener("click", function () {
+        newTagBtn.hidden = true;
+        tagInput.hidden = false;
+        tagInput.focus();
+      });
+
+      detailsTags.appendChild(newTagBtn);
+      detailsTags.appendChild(tagInput);
+    } else {
+      var bulkWrap = document.createElement("div");
+      bulkWrap.className = "tag-bulk-actions";
+
+      var tagAllBtn = document.createElement("button");
+      tagAllBtn.className = "btn btn-ghost";
+      tagAllBtn.textContent = "Tag all children";
+      tagAllBtn.addEventListener("click", function () { openTagPicker("all", node.id); });
+      bulkWrap.appendChild(tagAllBtn);
+
+      var tagImmediateBtn = document.createElement("button");
+      tagImmediateBtn.className = "btn btn-ghost";
+      tagImmediateBtn.textContent = "Tag immediate children";
+      tagImmediateBtn.addEventListener("click", function () { openTagPicker("immediate", node.id); });
+      bulkWrap.appendChild(tagImmediateBtn);
+
+      detailsTags.appendChild(bulkWrap);
+    }
+
+    // images
+    imageUploadError.hidden = true;
+    detailsImages.innerHTML = "";
+    (node.images || []).forEach(function (img, idx) {
+      var thumb = document.createElement("div");
+      thumb.className = "details-image-thumb";
+
+      var imgEl = document.createElement("img");
+      imgEl.src = img.url;
+      imgEl.alt = "";
+      imgEl.addEventListener("click", function () { openLightbox(node.images, idx); });
+      thumb.appendChild(imgEl);
+
+      var delBtn = document.createElement("button");
+      delBtn.className = "icon-btn danger details-image-delete";
+      delBtn.innerHTML = ICONS.close;
+      delBtn.title = "Remove image";
+      delBtn.addEventListener("click", function (e) {
+        e.stopPropagation();
+        deleteImage(node.id, img.id);
+      });
+      thumb.appendChild(delBtn);
+
+      detailsImages.appendChild(thumb);
+    });
 
     // children list
     detailsChildren.innerHTML = "";
@@ -1494,6 +1816,29 @@ import { firebaseConfig } from "./firebase-config.js";
   });
   detailsNotes.addEventListener("blur", flushPendingRemoteIfIdle);
 
+  addImageBtn.addEventListener("click", function () { imageInput.click(); });
+  imageInput.addEventListener("change", function () {
+    var file = imageInput.files && imageInput.files[0];
+    imageInput.value = "";
+    if (!file || !detailsId) return;
+    uploadImage(detailsId, file);
+  });
+
+  document.addEventListener("paste", function (e) {
+    if (detailsOverlay.hidden || !detailsId) return;
+    var items = (e.clipboardData && e.clipboardData.items) || [];
+    for (var i = 0; i < items.length; i++) {
+      if (items[i].type && items[i].type.indexOf("image/") === 0) {
+        var file = items[i].getAsFile();
+        if (file) {
+          e.preventDefault();
+          uploadImage(detailsId, file);
+        }
+        return;
+      }
+    }
+  });
+
   detailsAddChildBtn.addEventListener("click", function () {
     var newId = addChild(detailsId, false);
     if (newId) openDetails(newId, true);
@@ -1508,6 +1853,137 @@ import { firebaseConfig } from "./firebase-config.js";
     if (e.target === detailsOverlay) closeDetails();
   });
 
+  // ---------- image lightbox ----------
+
+  var lightboxOverlay = document.getElementById("lightboxOverlay");
+  var lightboxImg = document.getElementById("lightboxImg");
+  var lightboxPrev = document.getElementById("lightboxPrev");
+  var lightboxNext = document.getElementById("lightboxNext");
+  var lightboxClose = document.getElementById("lightboxClose");
+  var lightboxCounter = document.getElementById("lightboxCounter");
+  var lightboxImages = [];
+  var lightboxIndex = 0;
+
+  lightboxClose.innerHTML = ICONS.close;
+  lightboxPrev.innerHTML = ICONS.caret;
+  lightboxNext.innerHTML = ICONS.caret;
+
+  function openLightbox(images, index) {
+    var wasHidden = lightboxOverlay.hidden;
+    lightboxImages = images;
+    lightboxIndex = index;
+    renderLightbox();
+    lightboxOverlay.hidden = false;
+    if (wasHidden) lockBodyScroll();
+  }
+
+  function renderLightbox() {
+    var img = lightboxImages[lightboxIndex];
+    if (!img) { closeLightbox(); return; }
+    lightboxImg.src = img.url;
+    lightboxCounter.textContent = (lightboxIndex + 1) + " / " + lightboxImages.length;
+    var multi = lightboxImages.length > 1;
+    lightboxPrev.hidden = !multi;
+    lightboxNext.hidden = !multi;
+  }
+
+  function closeLightbox() {
+    if (lightboxOverlay.hidden) return;
+    lightboxOverlay.hidden = true;
+    lightboxImg.src = "";
+    unlockBodyScroll();
+  }
+
+  function lightboxStep(delta) {
+    if (lightboxImages.length === 0) return;
+    lightboxIndex = (lightboxIndex + delta + lightboxImages.length) % lightboxImages.length;
+    renderLightbox();
+  }
+
+  lightboxPrev.addEventListener("click", function () { lightboxStep(-1); });
+  lightboxNext.addEventListener("click", function () { lightboxStep(1); });
+  lightboxClose.addEventListener("click", closeLightbox);
+  lightboxOverlay.addEventListener("click", function (e) {
+    if (e.target === lightboxOverlay) closeLightbox();
+  });
+
+  document.addEventListener("keydown", function (e) {
+    if (lightboxOverlay.hidden) return;
+    if (e.key === "ArrowLeft") { e.preventDefault(); lightboxStep(-1); }
+    else if (e.key === "ArrowRight") { e.preventDefault(); lightboxStep(1); }
+  });
+
+  // ---------- tag picker (used by "tag all/immediate children") ----------
+
+  var tagPickerOverlay = document.getElementById("tagPickerOverlay");
+  var tagPickerTitle = document.getElementById("tagPickerTitle");
+  var tagPickerList = document.getElementById("tagPickerList");
+  var tagPickerInput = document.getElementById("tagPickerInput");
+  var tagPickerNewBtn = document.getElementById("tagPickerNewBtn");
+  var tagPickerCancelBtn = document.getElementById("tagPickerCancelBtn");
+  var tagPickerMode = null; // "all" | "immediate"
+  var tagPickerNodeId = null;
+
+  function openTagPicker(mode, nodeId) {
+    tagPickerMode = mode;
+    tagPickerNodeId = nodeId;
+    tagPickerTitle.textContent = mode === "all" ? "Tag all children" : "Tag immediate children";
+    tagPickerList.innerHTML = "";
+    var tags = allProjectTags(currentProject());
+    if (tags.length === 0) {
+      var empty = document.createElement("div");
+      empty.className = "dash-empty";
+      empty.textContent = "No tags yet - create one below.";
+      tagPickerList.appendChild(empty);
+    } else {
+      tags.forEach(function (t) {
+        var btn = document.createElement("button");
+        btn.className = "tag-chip tag-chip-add";
+        btn.textContent = t;
+        btn.addEventListener("click", function () { applyTagPicker(t); });
+        tagPickerList.appendChild(btn);
+      });
+    }
+    tagPickerInput.hidden = true;
+    tagPickerInput.value = "";
+    tagPickerNewBtn.hidden = false;
+    var wasHidden = tagPickerOverlay.hidden;
+    tagPickerOverlay.hidden = false;
+    if (wasHidden) lockBodyScroll();
+  }
+
+  function applyTagPicker(tag) {
+    var trimmed = (tag || "").trim();
+    if (!trimmed) return;
+    if (tagPickerMode === "all") tagAllChildren(tagPickerNodeId, trimmed);
+    else tagImmediateChildren(tagPickerNodeId, trimmed);
+    closeTagPicker();
+  }
+
+  function closeTagPicker() {
+    if (tagPickerOverlay.hidden) return;
+    tagPickerOverlay.hidden = true;
+    tagPickerMode = null;
+    tagPickerNodeId = null;
+    unlockBodyScroll();
+  }
+
+  tagPickerNewBtn.addEventListener("click", function () {
+    tagPickerNewBtn.hidden = true;
+    tagPickerInput.hidden = false;
+    tagPickerInput.focus();
+  });
+  tagPickerInput.addEventListener("keydown", function (e) {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      applyTagPicker(tagPickerInput.value);
+    }
+  });
+  tagPickerCancelBtn.addEventListener("click", closeTagPicker);
+  tagPickerOverlay.addEventListener("click", function (e) {
+    if (e.target === tagPickerOverlay) closeTagPicker();
+  });
+
   // ---------- confirm dialog (replaces window.confirm, which some browsers
   // silently start blocking after a page has shown several native dialogs) ----------
 
@@ -1520,13 +1996,17 @@ import { firebaseConfig } from "./firebase-config.js";
   function showConfirm(message, onConfirm) {
     confirmMessage.textContent = message;
     confirmCallback = onConfirm;
+    var wasHidden = confirmOverlay.hidden;
     confirmOverlay.hidden = false;
+    if (wasHidden) lockBodyScroll();
     confirmOkBtn.focus();
   }
 
   function closeConfirm() {
+    if (confirmOverlay.hidden) return;
     confirmOverlay.hidden = true;
     confirmCallback = null;
+    unlockBodyScroll();
   }
 
   confirmOkBtn.addEventListener("click", function () {
@@ -1541,7 +2021,11 @@ import { firebaseConfig } from "./firebase-config.js";
 
   document.addEventListener("keydown", function (e) {
     if (e.key !== "Escape") return;
-    if (!confirmOverlay.hidden) {
+    if (!lightboxOverlay.hidden) {
+      closeLightbox();
+    } else if (!tagPickerOverlay.hidden) {
+      closeTagPicker();
+    } else if (!confirmOverlay.hidden) {
       closeConfirm();
     } else if (!detailsOverlay.hidden) {
       closeDetails();
@@ -1630,7 +2114,9 @@ import { firebaseConfig } from "./firebase-config.js";
   }
 
   function openTimeline() {
+    var wasHidden = timelineOverlay.hidden;
     timelineOverlay.hidden = false;
+    if (wasHidden) lockBodyScroll();
     timelineList.innerHTML = '<div class="timeline-loading">Loading...</div>';
     if (!historyCollectionRef) return;
     var q = query(historyCollectionRef, orderBy("timestamp", "desc"), limit(MAX_HISTORY_ENTRIES));
@@ -1650,7 +2136,9 @@ import { firebaseConfig } from "./firebase-config.js";
   }
 
   function closeTimeline() {
+    if (timelineOverlay.hidden) return;
     timelineOverlay.hidden = true;
+    unlockBodyScroll();
   }
 
   function revertToEntry(snapshotState) {
@@ -1686,25 +2174,63 @@ import { firebaseConfig } from "./firebase-config.js";
   var dashFullTitle = document.getElementById("dashFullTitle");
   var dashFullClose = document.getElementById("dashFullClose");
   var dashFullList = document.getElementById("dashFullList");
+  var dashFullTagFilter = document.getElementById("dashFullTagFilter");
+  var dashFullAllItems = [];
+  var dashFullEmptyText = "";
 
   dashFullClose.innerHTML = ICONS.close;
 
   function openDashFull(title, items, emptyText) {
     dashFullTitle.textContent = title;
-    dashFullList.innerHTML = "";
-    if (items.length === 0) {
-      var empty = document.createElement("div");
-      empty.className = "dash-empty";
-      empty.textContent = emptyText;
-      dashFullList.appendChild(empty);
-    } else {
-      items.forEach(function (item) { dashFullList.appendChild(buildDashRow(item)); });
-    }
+    dashFullAllItems = items;
+    dashFullEmptyText = emptyText;
+
+    var tagSet = {};
+    items.forEach(function (item) {
+      (item.node.tags || []).forEach(function (t) { tagSet[t] = true; });
+    });
+    var tags = Object.keys(tagSet).sort();
+    dashFullTagFilter.innerHTML = "";
+    var allOpt = document.createElement("option");
+    allOpt.value = "";
+    allOpt.textContent = "All tags";
+    dashFullTagFilter.appendChild(allOpt);
+    tags.forEach(function (t) {
+      var opt = document.createElement("option");
+      opt.value = t;
+      opt.textContent = t;
+      dashFullTagFilter.appendChild(opt);
+    });
+    dashFullTagFilter.hidden = tags.length === 0;
+
+    renderDashFullFiltered();
+    var wasHidden = dashFullOverlay.hidden;
     dashFullOverlay.hidden = false;
+    if (wasHidden) lockBodyScroll();
   }
 
+  function renderDashFullFiltered() {
+    var filterTag = dashFullTagFilter.value;
+    var filtered = filterTag
+      ? dashFullAllItems.filter(function (item) { return (item.node.tags || []).indexOf(filterTag) !== -1; })
+      : dashFullAllItems;
+    dashFullList.innerHTML = "";
+    if (filtered.length === 0) {
+      var empty = document.createElement("div");
+      empty.className = "dash-empty";
+      empty.textContent = filterTag ? "Nothing tagged \"" + filterTag + "\"." : dashFullEmptyText;
+      dashFullList.appendChild(empty);
+    } else {
+      filtered.forEach(function (item) { dashFullList.appendChild(buildDashRow(item)); });
+    }
+  }
+
+  dashFullTagFilter.addEventListener("change", renderDashFullFiltered);
+
   function closeDashFull() {
+    if (dashFullOverlay.hidden) return;
     dashFullOverlay.hidden = true;
+    unlockBodyScroll();
   }
 
   dashFullClose.addEventListener("click", closeDashFull);
