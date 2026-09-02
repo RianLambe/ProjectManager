@@ -4,7 +4,14 @@ import {
   doc,
   onSnapshot,
   setDoc,
-  enableIndexedDbPersistence
+  enableIndexedDbPersistence,
+  collection,
+  addDoc,
+  query,
+  orderBy,
+  limit,
+  getDocs,
+  deleteDoc
 } from "https://www.gstatic.com/firebasejs/12.18.0/firebase-firestore.js";
 import {
   getAuth,
@@ -24,6 +31,10 @@ import { firebaseConfig } from "./firebase-config.js";
   var projectMenu = document.getElementById("projectMenu");
   var projectMenuList = document.getElementById("projectMenuList");
   var addProjectBtn = document.getElementById("addProjectBtn");
+  var timelineBtn = document.getElementById("timelineBtn");
+  var priorityBtn = document.getElementById("priorityBtn");
+  var unblockedBtn = document.getElementById("unblockedBtn");
+  var lockedBtn = document.getElementById("lockedBtn");
 
   var state = normalizeState(null);
   var focusRequest = null; // id of a node to focus+select after next render
@@ -33,23 +44,155 @@ import { firebaseConfig } from "./firebase-config.js";
   var renameOriginalId = null; // id of the node currently being renamed
   var renameOriginalText = null; // its text when editing started, restored on Escape
   var caretClickTimer = null; // used to tell a single click on a caret apart from a double click
+  var nodeClickTimer = null; // used to tell a single click on a task apart from a double click
 
   var ICONS = {
     caret: '<svg viewBox="0 0 24 24" width="12" height="12"><path d="M6 9l6 6 6-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>',
     plus: '<svg viewBox="0 0 24 24" width="14" height="14"><path d="M12 5v14M5 12h14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>',
     trash: '<svg viewBox="0 0 24 24" width="14" height="14"><path d="M4 7h16M9 7V4h6v3M6 7l1 13a1 1 0 001 1h8a1 1 0 001-1l1-13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>',
     close: '<svg viewBox="0 0 24 24" width="16" height="16"><path d="M6 6l12 12M18 6L6 18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>',
-    menu: '<svg viewBox="0 0 24 24" width="16" height="16"><path d="M4 6h16M4 12h16M4 18h16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>'
+    menu: '<svg viewBox="0 0 24 24" width="16" height="16"><path d="M4 6h16M4 12h16M4 18h16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>',
+    clock: '<svg viewBox="0 0 24 24" width="16" height="16"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 7v5l3.5 2" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+    star: '<svg viewBox="0 0 24 24" width="14" height="14"><path d="M12 2l2.9 6.26 6.9.6-5.2 4.53 1.58 6.77L12 16.9l-6.18 3.26L7.4 13.4 2.2 8.86l6.9-.6L12 2z" fill="currentColor"/></svg>',
+    lock: '<svg viewBox="0 0 24 24" width="12" height="12"><rect x="5" y="11" width="14" height="9" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M8 11V7a4 4 0 018 0v4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>'
   };
 
   hamburgerBtn.innerHTML = ICONS.menu;
+  timelineBtn.innerHTML = ICONS.clock;
 
   // ---------- persistence (Firestore, live across devices) ----------
 
   var boardDocRef = null;
+  var historyCollectionRef = null;
   var saveTimer = null;
   var pendingRemoteState = null; // a remote update that arrived while the user was mid-edit
   var hasPendingWrite = false; // true from the moment a local change happens until it's confirmed saved
+
+  // ---------- timeline (version history) ----------
+
+  var CHECKPOINT_INTERVAL_MS = 3 * 60 * 1000; // min gap between automatic checkpoints
+  var MAX_HISTORY_ENTRIES = 40;
+  var historyBaselineSet = false; // becomes true once we've loaded real data to diff against
+  var lastCheckpointState = null; // full state as of the last checkpoint
+  var lastCheckpointTime = 0;
+
+  function deepClone(obj) {
+    return JSON.parse(JSON.stringify(obj));
+  }
+
+  // Flattens every project's boards/tasks into id -> {name, completed, parentId, kind}
+  // so two states can be diffed by id regardless of where a node moved to.
+  function flattenState(s) {
+    var map = {};
+    (s.projects || []).forEach(function (project) {
+      (project.trees || []).forEach(function (tree) {
+        walk(tree, null, "board");
+      });
+    });
+    return map;
+
+    function walk(node, parentId, kind) {
+      map[node.id] = { name: node.name, completed: !!node.completed, parentId: parentId, kind: kind };
+      (node.children || []).forEach(function (child) {
+        walk(child, node.id, "task");
+      });
+    }
+  }
+
+  function pathFor(map, id) {
+    var names = [];
+    var cur = map[id];
+    var p = cur ? cur.parentId : null;
+    while (p) {
+      var pn = map[p];
+      if (!pn) break;
+      names.unshift(pn.name);
+      p = pn.parentId;
+    }
+    return names;
+  }
+
+  function isDescendantOfSet(map, id, idSet) {
+    var p = map[id] ? map[id].parentId : null;
+    while (p) {
+      if (idSet[p]) return true;
+      p = map[p] ? map[p].parentId : null;
+    }
+    return false;
+  }
+
+  // Compares two full board states and summarizes what changed: items added,
+  // items removed, and completion toggles. When a whole branch was added or
+  // removed, only its top-most node is reported (its descendants are implied).
+  function diffStates(oldState, newState) {
+    var oldMap = flattenState(oldState);
+    var newMap = flattenState(newState);
+
+    var addedSet = {};
+    Object.keys(newMap).forEach(function (id) { if (!oldMap[id]) addedSet[id] = true; });
+    var removedSet = {};
+    Object.keys(oldMap).forEach(function (id) { if (!newMap[id]) removedSet[id] = true; });
+
+    var added = [];
+    Object.keys(addedSet).forEach(function (id) {
+      if (isDescendantOfSet(newMap, id, addedSet)) return;
+      added.push({ name: newMap[id].name, kind: newMap[id].kind, path: pathFor(newMap, id) });
+    });
+
+    var removed = [];
+    Object.keys(removedSet).forEach(function (id) {
+      if (isDescendantOfSet(oldMap, id, removedSet)) return;
+      removed.push({ name: oldMap[id].name, kind: oldMap[id].kind, path: pathFor(oldMap, id) });
+    });
+
+    var checked = [], unchecked = [];
+    Object.keys(newMap).forEach(function (id) {
+      if (!oldMap[id]) return;
+      if (oldMap[id].completed === newMap[id].completed) return;
+      var item = { name: newMap[id].name, path: pathFor(newMap, id) };
+      if (newMap[id].completed) checked.push(item); else unchecked.push(item);
+    });
+
+    return {
+      added: added,
+      removed: removed,
+      checked: checked,
+      unchecked: unchecked,
+      hasChanges: added.length > 0 || removed.length > 0 || checked.length > 0 || unchecked.length > 0
+    };
+  }
+
+  function addHistoryEntry(timestamp, snapshotState, summary) {
+    if (!historyCollectionRef) return;
+    addDoc(historyCollectionRef, { timestamp: timestamp, state: snapshotState, summary: summary })
+      .then(pruneHistory)
+      .catch(function (err) { console.error("History checkpoint failed", err); });
+  }
+
+  function pruneHistory() {
+    var q = query(historyCollectionRef, orderBy("timestamp", "desc"), limit(200));
+    getDocs(q).then(function (snap) {
+      if (snap.docs.length <= MAX_HISTORY_ENTRIES) return;
+      snap.docs.slice(MAX_HISTORY_ENTRIES).forEach(function (d) {
+        deleteDoc(d.ref).catch(function () {});
+      });
+    }).catch(function () {});
+  }
+
+  // Called after every render. Throttled to at most one checkpoint per
+  // CHECKPOINT_INTERVAL_MS, and only writes an entry when something actually
+  // changed since the last one.
+  function maybeCheckpoint() {
+    if (!historyBaselineSet) return;
+    var now = Date.now();
+    if (now - lastCheckpointTime < CHECKPOINT_INTERVAL_MS) return;
+    var diff = diffStates(lastCheckpointState, state);
+    if (diff.hasChanges) {
+      addHistoryEntry(now, deepClone(state), diff);
+      lastCheckpointState = deepClone(state);
+    }
+    lastCheckpointTime = now;
+  }
 
   function setSyncStatus(text, cls) {
     if (!syncStatusEl) return;
@@ -93,6 +236,11 @@ import { firebaseConfig } from "./firebase-config.js";
 
   function applyRemoteState(data) {
     state = normalizeState(data);
+    if (!historyBaselineSet) {
+      lastCheckpointState = deepClone(state);
+      lastCheckpointTime = Date.now();
+      historyBaselineSet = true;
+    }
     render();
     if (detailsId) renderDetails();
   }
@@ -118,6 +266,7 @@ import { firebaseConfig } from "./firebase-config.js";
     var auth = getAuth(app);
     var db = getFirestore(app);
     boardDocRef = doc(db, "boards", "main");
+    historyCollectionRef = collection(db, "boards", "main", "history");
 
     enableIndexedDbPersistence(db).catch(function () {
       // fails silently in unsupported browsers or with multiple tabs open;
@@ -188,6 +337,8 @@ import { firebaseConfig } from "./firebase-config.js";
       completed: false,
       collapsed: false,
       notes: "",
+      priority: false,
+      blockedBy: null,
       createdAt: Date.now(),
       children: []
     };
@@ -204,6 +355,39 @@ import { firebaseConfig } from "./firebase-config.js";
       total += p.total;
     }
     return { done: done, total: total };
+  }
+
+  // A branch counts as "done" the same way it counts as 100% complete -
+  // works for leaves (total 1) and branches (sums children) alike.
+  function isNodeDone(node) {
+    var p = computeProgress(node);
+    return p.total > 0 && p.done === p.total;
+  }
+
+  // True while a task's declared blocker exists and isn't done yet. A
+  // blocker that was deleted no longer blocks anything.
+  function isBlocked(node) {
+    if (!node.blockedBy) return false;
+    var blocker = findNode(node.blockedBy);
+    if (!blocker) return false;
+    return !isNodeDone(blocker.node);
+  }
+
+  // Every board and task in a project, each with the ancestor names leading
+  // to it - used for the "Blocked by" picker and the priority/unblocked
+  // dashboard, where items from anywhere in the project need to be listed
+  // with enough context to tell them apart.
+  function flattenProjectNodes(project) {
+    var out = [];
+    project.trees.forEach(function (tree) { walk(tree, []); });
+    return out;
+
+    function walk(node, ancestors) {
+      out.push({ id: node.id, name: node.name, node: node, path: ancestors });
+      node.children.forEach(function (child) {
+        walk(child, ancestors.concat([node.name]));
+      });
+    }
   }
 
   // Finds a project, board, or task by id.
@@ -348,17 +532,26 @@ import { firebaseConfig } from "./firebase-config.js";
     render();
   }
 
-  function setCollapsedDeep(node, value) {
-    node.collapsed = value;
+  // Flips each branch's own collapsed flag independently, rather than
+  // forcing every descendant to match one new state - a branch that was
+  // already expanded while its sibling was collapsed keeps that difference,
+  // it just each flips to the opposite of whatever it currently was.
+  function toggleCollapsedDeep(node) {
+    node.collapsed = !node.collapsed;
     for (var i = 0; i < node.children.length; i++) {
-      if (node.children[i].children.length > 0) setCollapsedDeep(node.children[i], value);
+      if (node.children[i].children.length > 0) toggleCollapsedDeep(node.children[i]);
     }
   }
 
+  // Toggles every descendant's own collapsed flag, but leaves the clicked
+  // branch's own state exactly as it was - only its children (and further
+  // down) are affected.
   function toggleCollapseRecursive(id) {
     var found = findNode(id);
     if (!found) return;
-    setCollapsedDeep(found.node, !found.node.collapsed);
+    for (var i = 0; i < found.node.children.length; i++) {
+      if (found.node.children[i].children.length > 0) toggleCollapsedDeep(found.node.children[i]);
+    }
     saveState();
     render();
   }
@@ -432,6 +625,22 @@ import { firebaseConfig } from "./firebase-config.js";
     var found = findNode(id);
     if (!found) return;
     found.node.completed = value;
+    saveState();
+    render();
+  }
+
+  function togglePriority(id) {
+    var found = findNode(id);
+    if (!found) return;
+    found.node.priority = !found.node.priority;
+    saveState();
+    render();
+  }
+
+  function setBlockedBy(id, blockerId) {
+    var found = findNode(id);
+    if (!found) return;
+    found.node.blockedBy = blockerId || null;
     saveState();
     render();
   }
@@ -527,6 +736,8 @@ import { firebaseConfig } from "./firebase-config.js";
     projectNameEl.setAttribute("data-id", project.id);
     document.title = project.name;
 
+    renderDashboard(project);
+
     board.innerHTML = "";
     emptyState.hidden = project.trees.length > 0;
     for (var i = 0; i < project.trees.length; i++) {
@@ -540,6 +751,58 @@ import { firebaseConfig } from "./firebase-config.js";
       }
       focusRequest = null;
     }
+    maybeCheckpoint();
+  }
+
+  // Priority = flagged and not done yet. Unblocked = actionable - not done,
+  // not waiting on a blocker - which by default is every task, since a task
+  // only counts as blocked once you've explicitly set one on it. Locked is
+  // the opposite: not done, and still waiting on an unfinished blocker. All
+  // three are scoped to individual tasks, not branch/board heads - a branch
+  // is just a container, not something you "do".
+  function computeDashItems(project, kind) {
+    var flat = flattenProjectNodes(project).filter(function (item) {
+      return item.node.children.length === 0;
+    });
+    if (kind === "priority") {
+      return flat.filter(function (item) { return item.node.priority && !isNodeDone(item.node); });
+    }
+    if (kind === "locked") {
+      return flat.filter(function (item) { return !isNodeDone(item.node) && isBlocked(item.node); });
+    }
+    return flat.filter(function (item) { return !isNodeDone(item.node) && !isBlocked(item.node); });
+  }
+
+  function renderDashboard(project) {
+    priorityBtn.textContent = "Priority (" + computeDashItems(project, "priority").length + ")";
+    unblockedBtn.textContent = "Unblocked (" + computeDashItems(project, "unblocked").length + ")";
+    lockedBtn.textContent = "Locked (" + computeDashItems(project, "locked").length + ")";
+  }
+
+  function buildDashRow(item) {
+    var row = document.createElement("div");
+    row.className = "dash-row";
+
+    var cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.className = "leaf-checkbox";
+    cb.checked = !!item.node.completed;
+    cb.addEventListener("change", function () { toggleCompleted(item.id, cb.checked); });
+    row.appendChild(cb);
+
+    var nameBtn = document.createElement("button");
+    nameBtn.className = "dash-row-name";
+    if (item.path.length) {
+      var pathSpan = document.createElement("span");
+      pathSpan.className = "dash-row-path";
+      pathSpan.textContent = item.path.join(" / ") + " / ";
+      nameBtn.appendChild(pathSpan);
+    }
+    nameBtn.appendChild(document.createTextNode(item.name));
+    nameBtn.addEventListener("click", function () { closeDashFull(); openDetails(item.id); });
+    row.appendChild(nameBtn);
+
+    return row;
   }
 
   function cssEscape(s) {
@@ -692,6 +955,9 @@ import { firebaseConfig } from "./firebase-config.js";
 
     var isLeaf = node.children.length === 0;
     if (isLeaf && node.completed) li.classList.add("completed");
+    var blockerFound = node.blockedBy ? findNode(node.blockedBy) : null;
+    var blocked = blockerFound ? !isNodeDone(blockerFound.node) : false;
+    if (blocked) li.classList.add("blocked");
 
     var row = document.createElement("div");
     row.className = "node-row";
@@ -731,6 +997,22 @@ import { firebaseConfig } from "./firebase-config.js";
     nameSpan.setAttribute("data-id", node.id);
     nameSpan.setAttribute("data-role", "rename");
     labelWrap.appendChild(nameSpan);
+
+    var starBtn = document.createElement("button");
+    starBtn.className = "icon-btn priority-star" + (node.priority ? " active" : "");
+    starBtn.title = node.priority ? "Remove priority" : "Mark as priority";
+    starBtn.innerHTML = ICONS.star;
+    starBtn.setAttribute("data-id", node.id);
+    starBtn.setAttribute("data-role", "toggle-priority");
+    labelWrap.appendChild(starBtn);
+
+    if (blocked) {
+      var lockIcon = document.createElement("span");
+      lockIcon.className = "blocked-lock";
+      lockIcon.title = 'Blocked by "' + blockerFound.node.name + '"';
+      lockIcon.innerHTML = ICONS.lock;
+      labelWrap.appendChild(lockIcon);
+    }
 
     if (node.notes && node.notes.trim()) {
       var notesDot = document.createElement("span");
@@ -806,6 +1088,9 @@ import { firebaseConfig } from "./firebase-config.js";
       return;
     }
 
+    var starToggle = e.target.closest('[data-role="toggle-priority"]');
+    if (starToggle) { togglePriority(starToggle.getAttribute("data-id")); return; }
+
     var addChildBtn = e.target.closest('[data-role="add-child"]');
     if (addChildBtn) { addChild(addChildBtn.getAttribute("data-id")); return; }
 
@@ -825,18 +1110,40 @@ import { firebaseConfig } from "./firebase-config.js";
       return;
     }
 
-    // clicking the name itself is for inline renaming, not for opening details
-    if (e.target.closest('[data-role="rename"]')) return;
     if (e.target.closest('[data-role="toggle-complete"]')) return;
 
+    // a task row is one button: a single click opens its details, a double
+    // click renames it - same single/double debounce trick as the caret above
     var row = e.target.closest(".node-row");
-    if (row) { openDetails(row.getAttribute("data-id")); return; }
+    if (row) {
+      var rowId = row.getAttribute("data-id");
+      if (e.detail >= 2) {
+        clearTimeout(nodeClickTimer);
+        var nameEl = row.querySelector(".node-name");
+        if (nameEl) { nameEl.focus(); selectAllText(nameEl); }
+      } else {
+        clearTimeout(nodeClickTimer);
+        nodeClickTimer = setTimeout(function () { openDetails(rowId); }, 250);
+      }
+      return;
+    }
+
+    // board header title keeps its old behavior: click the name to rename it
+    if (e.target.closest('[data-role="rename"]')) return;
 
     var headerHit = e.target.closest(".tree-card-header-top") || e.target.closest(".tree-progress-wrap");
     if (headerHit) {
       var card = e.target.closest(".tree-card");
       if (card) openDetails(card.getAttribute("data-tree-id"));
     }
+  });
+
+  // Stops a plain click on a task's name from immediately focusing it for
+  // editing (its default behavior as a contenteditable element) - renaming a
+  // task now only starts on a double click, handled explicitly in the click
+  // listener below.
+  board.addEventListener("mousedown", function (e) {
+    if (e.target.closest(".node-name")) e.preventDefault();
   });
 
   board.addEventListener("change", function (e) {
@@ -974,6 +1281,7 @@ import { firebaseConfig } from "./firebase-config.js";
   var detailsBreadcrumb = document.getElementById("detailsBreadcrumb");
   var detailsTitle = document.getElementById("detailsTitle");
   var detailsMeta = document.getElementById("detailsMeta");
+  var detailsDeps = document.getElementById("detailsDeps");
   var detailsNotes = document.getElementById("detailsNotes");
   var detailsChildren = document.getElementById("detailsChildren");
   var detailsAddChildBtn = document.getElementById("detailsAddChild");
@@ -1059,6 +1367,60 @@ import { firebaseConfig } from "./firebase-config.js";
       created.className = "details-meta-created";
       created.textContent = "Created " + new Date(node.createdAt).toLocaleDateString();
       detailsMeta.appendChild(created);
+    }
+
+    // priority + blocked-by
+    detailsDeps.innerHTML = "";
+
+    var priorityLabel = document.createElement("label");
+    priorityLabel.className = "details-priority-toggle";
+    var priorityCb = document.createElement("input");
+    priorityCb.type = "checkbox";
+    priorityCb.checked = !!node.priority;
+    priorityCb.addEventListener("change", function () { togglePriority(node.id); });
+    var prioritySpan = document.createElement("span");
+    prioritySpan.textContent = "Priority";
+    priorityLabel.appendChild(priorityCb);
+    priorityLabel.appendChild(prioritySpan);
+    detailsDeps.appendChild(priorityLabel);
+
+    var blockedLabelEl = document.createElement("label");
+    blockedLabelEl.className = "details-label";
+    blockedLabelEl.textContent = "Blocked by";
+    detailsDeps.appendChild(blockedLabelEl);
+
+    var blockedSelect = document.createElement("select");
+    blockedSelect.className = "details-blocked-select";
+    var noneOpt = document.createElement("option");
+    noneOpt.value = "";
+    noneOpt.textContent = "None";
+    blockedSelect.appendChild(noneOpt);
+
+    var excluded = {};
+    excluded[node.id] = true;
+    (function collectDescendants(n) {
+      n.children.forEach(function (c) { excluded[c.id] = true; collectDescendants(c); });
+    })(node);
+
+    flattenProjectNodes(currentProject()).forEach(function (item) {
+      if (excluded[item.id]) return;
+      var opt = document.createElement("option");
+      opt.value = item.id;
+      opt.textContent = (item.path.length ? item.path.join(" / ") + " / " : "") + item.name;
+      if (node.blockedBy === item.id) opt.selected = true;
+      blockedSelect.appendChild(opt);
+    });
+
+    blockedSelect.addEventListener("change", function () {
+      setBlockedBy(node.id, blockedSelect.value || null);
+    });
+    detailsDeps.appendChild(blockedSelect);
+
+    if (isBlocked(node)) {
+      var blockedNote = document.createElement("div");
+      blockedNote.className = "details-blocked-note";
+      blockedNote.textContent = 'Blocked until "' + findNode(node.blockedBy).node.name + '" is done.';
+      detailsDeps.appendChild(blockedNote);
     }
 
     // children list
@@ -1183,9 +1545,181 @@ import { firebaseConfig } from "./firebase-config.js";
       closeConfirm();
     } else if (!detailsOverlay.hidden) {
       closeDetails();
+    } else if (!dashFullOverlay.hidden) {
+      closeDashFull();
+    } else if (!timelineOverlay.hidden) {
+      closeTimeline();
     } else if (!projectMenu.hidden) {
       closeProjectMenu();
     }
+  });
+
+  // ---------- timeline panel ----------
+
+  var timelineOverlay = document.getElementById("timelineOverlay");
+  var timelineClose = document.getElementById("timelineClose");
+  var timelineList = document.getElementById("timelineList");
+
+  timelineClose.innerHTML = ICONS.close;
+
+  function formatRelativeTime(ts) {
+    var diffMin = Math.round((Date.now() - ts) / 60000);
+    if (diffMin < 1) return "Just now";
+    if (diffMin < 60) return diffMin + " minute" + (diffMin === 1 ? "" : "s") + " ago";
+    var diffHr = Math.round(diffMin / 60);
+    if (diffHr < 24) return diffHr + " hour" + (diffHr === 1 ? "" : "s") + " ago";
+    var diffDay = Math.round(diffHr / 24);
+    return diffDay + " day" + (diffDay === 1 ? "" : "s") + " ago";
+  }
+
+  function makeBadge(text, cls) {
+    var b = document.createElement("span");
+    b.className = "timeline-badge " + cls;
+    b.textContent = text;
+    return b;
+  }
+
+  function appendChanges(ul, list, label) {
+    if (!list || list.length === 0) return;
+    list.forEach(function (it) {
+      var li = document.createElement("li");
+      var prefix = it.path && it.path.length ? it.path.join(" / ") + " / " : "";
+      li.textContent = label + ": " + prefix + it.name;
+      ul.appendChild(li);
+    });
+  }
+
+  function renderTimelineEntry(id, data) {
+    var item = document.createElement("div");
+    item.className = "timeline-entry";
+
+    var head = document.createElement("div");
+    head.className = "timeline-entry-head";
+
+    var timeSpan = document.createElement("span");
+    timeSpan.className = "timeline-entry-time";
+    timeSpan.title = new Date(data.timestamp).toLocaleString();
+    timeSpan.textContent = formatRelativeTime(data.timestamp);
+    head.appendChild(timeSpan);
+
+    var badges = document.createElement("div");
+    badges.className = "timeline-badges";
+    var s = data.summary || {};
+    if (s.added && s.added.length) badges.appendChild(makeBadge("+" + s.added.length + " added", "added"));
+    if (s.removed && s.removed.length) badges.appendChild(makeBadge("-" + s.removed.length + " removed", "removed"));
+    if (s.checked && s.checked.length) badges.appendChild(makeBadge(s.checked.length + " checked off", "checked"));
+    if (s.unchecked && s.unchecked.length) badges.appendChild(makeBadge(s.unchecked.length + " unchecked", "unchecked"));
+    head.appendChild(badges);
+    item.appendChild(head);
+
+    var details = document.createElement("ul");
+    details.className = "timeline-entry-details";
+    appendChanges(details, s.added, "Added");
+    appendChanges(details, s.removed, "Removed");
+    appendChanges(details, s.checked, "Checked off");
+    appendChanges(details, s.unchecked, "Unchecked");
+    if (details.children.length > 0) item.appendChild(details);
+
+    var revertBtn = document.createElement("button");
+    revertBtn.className = "btn btn-ghost timeline-revert-btn";
+    revertBtn.textContent = "Revert to this version";
+    revertBtn.addEventListener("click", function () { revertToEntry(data.state); });
+    item.appendChild(revertBtn);
+
+    return item;
+  }
+
+  function openTimeline() {
+    timelineOverlay.hidden = false;
+    timelineList.innerHTML = '<div class="timeline-loading">Loading...</div>';
+    if (!historyCollectionRef) return;
+    var q = query(historyCollectionRef, orderBy("timestamp", "desc"), limit(MAX_HISTORY_ENTRIES));
+    getDocs(q).then(function (snap) {
+      timelineList.innerHTML = "";
+      if (snap.empty) {
+        timelineList.innerHTML = '<div class="timeline-empty">No history yet. Checkpoints are saved automatically every few minutes as you make changes.</div>';
+        return;
+      }
+      snap.forEach(function (docSnap) {
+        timelineList.appendChild(renderTimelineEntry(docSnap.id, docSnap.data()));
+      });
+    }).catch(function (err) {
+      console.error("Failed to load timeline", err);
+      timelineList.innerHTML = '<div class="timeline-empty">Failed to load history.</div>';
+    });
+  }
+
+  function closeTimeline() {
+    timelineOverlay.hidden = true;
+  }
+
+  function revertToEntry(snapshotState) {
+    showConfirm("Revert the board to this version? Your current state will be added to the timeline first so this can be undone.", function () {
+      clearTimeout(saveTimer);
+      hasPendingWrite = false;
+      var diff = diffStates(lastCheckpointState || state, state);
+      if (historyBaselineSet && diff.hasChanges) {
+        addHistoryEntry(Date.now(), deepClone(state), diff);
+      }
+      var restored = deepClone(snapshotState);
+      state = restored;
+      lastCheckpointState = deepClone(restored);
+      lastCheckpointTime = Date.now();
+      setDoc(boardDocRef, restored).catch(function (err) {
+        console.error("Revert failed", err);
+        setSyncStatus("Save failed - will retry", "error");
+      });
+      render();
+      closeTimeline();
+    });
+  }
+
+  timelineBtn.addEventListener("click", openTimeline);
+  timelineClose.addEventListener("click", closeTimeline);
+  timelineOverlay.addEventListener("click", function (e) {
+    if (e.target === timelineOverlay) closeTimeline();
+  });
+
+  // ---------- dashboard full-list panel ----------
+
+  var dashFullOverlay = document.getElementById("dashFullOverlay");
+  var dashFullTitle = document.getElementById("dashFullTitle");
+  var dashFullClose = document.getElementById("dashFullClose");
+  var dashFullList = document.getElementById("dashFullList");
+
+  dashFullClose.innerHTML = ICONS.close;
+
+  function openDashFull(title, items, emptyText) {
+    dashFullTitle.textContent = title;
+    dashFullList.innerHTML = "";
+    if (items.length === 0) {
+      var empty = document.createElement("div");
+      empty.className = "dash-empty";
+      empty.textContent = emptyText;
+      dashFullList.appendChild(empty);
+    } else {
+      items.forEach(function (item) { dashFullList.appendChild(buildDashRow(item)); });
+    }
+    dashFullOverlay.hidden = false;
+  }
+
+  function closeDashFull() {
+    dashFullOverlay.hidden = true;
+  }
+
+  dashFullClose.addEventListener("click", closeDashFull);
+  dashFullOverlay.addEventListener("click", function (e) {
+    if (e.target === dashFullOverlay) closeDashFull();
+  });
+
+  priorityBtn.addEventListener("click", function () {
+    openDashFull("Priority", computeDashItems(currentProject(), "priority"), "Nothing prioritized yet.");
+  });
+  unblockedBtn.addEventListener("click", function () {
+    openDashFull("Unblocked", computeDashItems(currentProject(), "unblocked"), "Nothing unblocked - everything is either done or blocked.");
+  });
+  lockedBtn.addEventListener("click", function () {
+    openDashFull("Locked", computeDashItems(currentProject(), "locked"), "Nothing locked.");
   });
 
   // ---------- top bar actions ----------

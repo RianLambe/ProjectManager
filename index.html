@@ -14,6 +14,7 @@
     </div>
     <div class="topbar-actions">
       <span id="syncStatus" class="sync-status">Connecting...</span>
+      <button id="timelineBtn" class="icon-btn timeline-btn" title="Timeline (version history)"></button>
       <button id="newTreeBtn" class="btn btn-primary">+ New Board</button>
       <input type="color" id="colorPickerInput" hidden>
     </div>
@@ -23,6 +24,12 @@
     <div id="projectMenuList" class="project-menu-list"></div>
     <button id="addProjectBtn" class="btn btn-ghost project-menu-add">+ New Project</button>
   </div>
+
+  <section id="dashboard" class="dashboard">
+    <button id="priorityBtn" class="btn btn-ghost dash-btn"></button>
+    <button id="unblockedBtn" class="btn btn-ghost dash-btn"></button>
+    <button id="lockedBtn" class="btn btn-ghost dash-btn"></button>
+  </section>
 
   <main id="board" class="board">
     <!-- tree cards get rendered here -->
@@ -41,6 +48,7 @@
       </div>
       <input id="detailsTitle" class="details-title-input" type="text" placeholder="Item name" spellcheck="false">
       <div id="detailsMeta" class="details-meta"></div>
+      <div id="detailsDeps" class="details-deps"></div>
       <label class="details-label" for="detailsNotes">Notes</label>
       <textarea id="detailsNotes" class="details-notes" rows="6" placeholder="Add more details..."></textarea>
       <div id="detailsChildren" class="details-children"></div>
@@ -48,6 +56,26 @@
         <button id="detailsAddChild" class="btn btn-ghost">Add sub-item</button>
         <button id="detailsDelete" class="btn btn-ghost danger">Delete</button>
       </div>
+    </div>
+  </div>
+
+  <div id="timelineOverlay" class="details-overlay" hidden>
+    <div class="details-panel timeline-panel" role="dialog" aria-modal="true">
+      <div class="details-panel-top">
+        <h2 class="timeline-title">Timeline</h2>
+        <button id="timelineClose" class="icon-btn" title="Close"></button>
+      </div>
+      <div id="timelineList" class="timeline-list"></div>
+    </div>
+  </div>
+
+  <div id="dashFullOverlay" class="details-overlay" hidden>
+    <div class="details-panel dash-full-panel" role="dialog" aria-modal="true">
+      <div class="details-panel-top">
+        <h2 id="dashFullTitle" class="timeline-title">Priority</h2>
+        <button id="dashFullClose" class="icon-btn" title="Close"></button>
+      </div>
+      <div id="dashFullList" class="dash-list dash-full-list"></div>
     </div>
   </div>
 
