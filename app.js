@@ -34,6 +34,7 @@ import { firebaseConfig } from "./firebase-config.js";
   var emptyState = document.getElementById("emptyState");
   var syncStatusEl = document.getElementById("syncStatus");
   var loadingScreen = document.getElementById("loadingScreen");
+  var boardExpandBackdrop = document.getElementById("boardExpandBackdrop");
 
   function hideLoadingScreen() {
     loadingScreen.classList.add("hidden");
@@ -77,7 +78,9 @@ import { firebaseConfig } from "./firebase-config.js";
     menu: '<svg viewBox="0 0 24 24" width="16" height="16"><path d="M4 6h16M4 12h16M4 18h16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>',
     clock: '<svg viewBox="0 0 24 24" width="16" height="16"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 7v5l3.5 2" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>',
     star: '<svg viewBox="0 0 24 24" width="14" height="14"><path d="M12 2l2.9 6.26 6.9.6-5.2 4.53 1.58 6.77L12 16.9l-6.18 3.26L7.4 13.4 2.2 8.86l6.9-.6L12 2z" fill="currentColor"/></svg>',
-    lock: '<svg viewBox="0 0 24 24" width="12" height="12"><rect x="5" y="11" width="14" height="9" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M8 11V7a4 4 0 018 0v4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>'
+    lock: '<svg viewBox="0 0 24 24" width="12" height="12"><rect x="5" y="11" width="14" height="9" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M8 11V7a4 4 0 018 0v4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>',
+    expand: '<svg viewBox="0 0 24 24" width="14" height="14"><path d="M8 3H3v5M16 3h5v5M8 21H3v-5M16 21h5v-5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+    collapse: '<svg viewBox="0 0 24 24" width="14" height="14"><path d="M3 9h5V4M21 9h-5V4M3 15h5v5M21 15h-5v5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>'
   };
 
   hamburgerBtn.innerHTML = ICONS.menu;
@@ -232,6 +235,7 @@ import { firebaseConfig } from "./firebase-config.js";
     if (active.getAttribute && active.getAttribute("data-role") === "rename") return true;
     if (active.id === "detailsTitle" || active.id === "detailsNotes") return true;
     if (active.classList && active.classList.contains("tag-input")) return true;
+    if (active.classList && active.classList.contains("blocked-by-search-input")) return true;
     return false;
   }
 
@@ -399,11 +403,26 @@ import { firebaseConfig } from "./firebase-config.js";
 
   // True while a task's declared blocker exists and isn't done yet. A
   // blocker that was deleted no longer blocks anything.
+  // Blocking a branch blocks everything under it: this checks the node's own
+  // blockedBy, and if that's clear, walks up through every ancestor (its
+  // parent branch, that branch's parent, ... up to the board) looking for
+  // one that's still blocked.
   function isBlocked(node) {
-    if (!node.blockedBy) return false;
-    var blocker = findNode(node.blockedBy);
-    if (!blocker) return false;
-    return !isNodeDone(blocker.node);
+    return !!activeBlockerFor(node);
+  }
+
+  // Returns the node actually responsible for blocking this one (its own
+  // blocker, or the nearest blocked ancestor's), or null if nothing is.
+  function activeBlockerFor(node) {
+    var path = buildPath(node.id);
+    if (path.length === 0) path = [node];
+    for (var i = 0; i < path.length; i++) {
+      if (path[i].blockedBy) {
+        var blocker = findNode(path[i].blockedBy);
+        if (blocker && !isNodeDone(blocker.node)) return blocker.node;
+      }
+    }
+    return null;
   }
 
   // Every board and task in a project, each with the ancestor names leading
@@ -709,18 +728,26 @@ import { firebaseConfig } from "./firebase-config.js";
     render();
   }
 
-  function deleteTree(id, onDeleted) {
-    var found = findNode(id);
-    if (!found) return;
-    showConfirm('Delete board "' + found.node.name + '" and everything in it?', function () {
-      var fresh = findNode(id);
-      if (!fresh) return;
-      fresh.siblings.splice(fresh.index, 1);
-      saveState();
-      render();
-      if (onDeleted) onDeleted();
-    });
+  var expandedTreeId = null; // id of the board currently shown full-window, if any
+
+  function expandBoard(id) {
+    if (expandedTreeId === id) { collapseBoard(); return; }
+    var wasExpanded = !!expandedTreeId;
+    expandedTreeId = id;
+    boardExpandBackdrop.hidden = false;
+    if (!wasExpanded) lockBodyScroll();
+    render();
   }
+
+  function collapseBoard() {
+    if (!expandedTreeId) return;
+    expandedTreeId = null;
+    boardExpandBackdrop.hidden = true;
+    unlockBodyScroll();
+    render();
+  }
+
+  boardExpandBackdrop.addEventListener("click", collapseBoard);
 
   function addChild(parentId, focusBoard, initialName) {
     if (focusBoard === undefined) focusBoard = true;
@@ -1133,7 +1160,7 @@ import { firebaseConfig } from "./firebase-config.js";
 
   function renderTreeCard(tree) {
     var card = document.createElement("div");
-    card.className = "tree-card";
+    card.className = "tree-card" + (tree.id === expandedTreeId ? " tree-card-expanded" : "");
     card.setAttribute("data-tree-id", tree.id);
     if (tree.color) {
       // set as a custom property (not the background shorthand directly) so
@@ -1168,12 +1195,13 @@ import { firebaseConfig } from "./firebase-config.js";
     colorBtn.setAttribute("data-role", "pick-color");
     colorBtn.style.background = tree.color || "";
 
-    var deleteBtn = document.createElement("button");
-    deleteBtn.className = "icon-btn danger";
-    deleteBtn.title = "Delete board";
-    deleteBtn.setAttribute("data-id", tree.id);
-    deleteBtn.setAttribute("data-role", "delete-tree");
-    deleteBtn.innerHTML = ICONS.trash;
+    var isExpanded = tree.id === expandedTreeId;
+    var expandBtn = document.createElement("button");
+    expandBtn.className = "icon-btn expand-btn";
+    expandBtn.title = isExpanded ? "Shrink board" : "Expand board";
+    expandBtn.setAttribute("data-id", tree.id);
+    expandBtn.setAttribute("data-role", "expand-tree");
+    expandBtn.innerHTML = isExpanded ? ICONS.collapse : ICONS.expand;
 
     top.appendChild(colorBtn);
 
@@ -1187,7 +1215,7 @@ import { firebaseConfig } from "./firebase-config.js";
       nameWrap.appendChild(treeNotesDot);
     }
     top.appendChild(nameWrap);
-    top.appendChild(deleteBtn);
+    top.appendChild(expandBtn);
     header.appendChild(top);
 
     var progress = computeProgress(tree);
@@ -1243,8 +1271,8 @@ import { firebaseConfig } from "./firebase-config.js";
 
     var isLeaf = node.children.length === 0;
     if (isLeaf && node.completed) li.classList.add("completed");
-    var blockerFound = node.blockedBy ? findNode(node.blockedBy) : null;
-    var blocked = blockerFound ? !isNodeDone(blockerFound.node) : false;
+    var activeBlocker = activeBlockerFor(node);
+    var blocked = !!activeBlocker;
     if (blocked) li.classList.add("blocked");
 
     var row = document.createElement("div");
@@ -1297,7 +1325,7 @@ import { firebaseConfig } from "./firebase-config.js";
     if (blocked) {
       var lockIcon = document.createElement("span");
       lockIcon.className = "blocked-lock";
-      lockIcon.title = 'Blocked by "' + blockerFound.node.name + '"';
+      lockIcon.title = 'Blocked by "' + activeBlocker.name + '"';
       lockIcon.innerHTML = ICONS.lock;
       labelWrap.appendChild(lockIcon);
     }
@@ -1380,8 +1408,8 @@ import { firebaseConfig } from "./firebase-config.js";
     var delNodeBtn = e.target.closest('[data-role="delete-node"]');
     if (delNodeBtn) { deleteNode(delNodeBtn.getAttribute("data-id")); return; }
 
-    var delTreeBtn = e.target.closest('[data-role="delete-tree"]');
-    if (delTreeBtn) { deleteTree(delTreeBtn.getAttribute("data-id")); return; }
+    var expandTreeBtn = e.target.closest('[data-role="expand-tree"]');
+    if (expandTreeBtn) { expandBoard(expandTreeBtn.getAttribute("data-id")); return; }
 
     var colorBtn = e.target.closest('[data-role="pick-color"]');
     if (colorBtn) {
@@ -1723,37 +1751,138 @@ import { firebaseConfig } from "./firebase-config.js";
     blockedLabelEl.textContent = "Blocked by";
     detailsDeps.appendChild(blockedLabelEl);
 
-    var blockedSelect = document.createElement("select");
-    blockedSelect.className = "details-blocked-select";
-    var noneOpt = document.createElement("option");
-    noneOpt.value = "";
-    noneOpt.textContent = "None";
-    blockedSelect.appendChild(noneOpt);
-
-    var excluded = {};
-    excluded[node.id] = true;
+    var blockedByExcluded = {};
+    blockedByExcluded[node.id] = true;
     (function collectDescendants(n) {
-      n.children.forEach(function (c) { excluded[c.id] = true; collectDescendants(c); });
+      n.children.forEach(function (c) { blockedByExcluded[c.id] = true; collectDescendants(c); });
     })(node);
 
-    flattenProjectNodes(currentProject()).forEach(function (item) {
-      if (excluded[item.id]) return;
-      var opt = document.createElement("option");
-      opt.value = item.id;
-      opt.textContent = (item.path.length ? item.path.join(" / ") + " / " : "") + item.name;
-      if (node.blockedBy === item.id) opt.selected = true;
-      blockedSelect.appendChild(opt);
+    function blockedByLabelFor(id) {
+      var item = flattenProjectNodes(currentProject()).filter(function (it) { return it.id === id; })[0];
+      if (!item) return "";
+      return (item.path.length ? item.path.join(" / ") + " / " : "") + item.name;
+    }
+
+    var blockedByWrap = document.createElement("div");
+    blockedByWrap.className = "blocked-by-combo";
+
+    var blockedByInput = document.createElement("input");
+    blockedByInput.type = "text";
+    blockedByInput.className = "blocked-by-search-input";
+    blockedByInput.placeholder = "None";
+    blockedByInput.autocomplete = "off";
+    blockedByInput.value = node.blockedBy ? blockedByLabelFor(node.blockedBy) : "";
+
+    var blockedByOptionsEl = document.createElement("div");
+    blockedByOptionsEl.className = "blocked-by-options";
+    blockedByOptionsEl.hidden = true;
+
+    var blockedByMatches = []; // current filtered matches, for Enter-to-pick-first
+    var blockedByOpen = false;
+
+    function selectBlockedByItem(id, label) {
+      setBlockedBy(node.id, id);
+      blockedByInput.value = label;
+      closeBlockedByOptions();
+    }
+
+    function renderBlockedByOptions(filterText) {
+      var q = filterText.trim().toLowerCase();
+      var items = flattenProjectNodes(currentProject()).filter(function (item) {
+        if (blockedByExcluded[item.id]) return false;
+        if (item.node.children.length > 0) return false; // exclude branch heads
+        var label = (item.path.length ? item.path.join(" / ") + " / " : "") + item.name;
+        return !q || label.toLowerCase().indexOf(q) !== -1;
+      });
+      blockedByMatches = items;
+
+      blockedByOptionsEl.innerHTML = "";
+
+      var noneOpt = document.createElement("button");
+      noneOpt.type = "button";
+      noneOpt.className = "blocked-by-option";
+      noneOpt.textContent = "None";
+      noneOpt.addEventListener("mousedown", function (e) {
+        e.preventDefault();
+        selectBlockedByItem(null, "");
+      });
+      blockedByOptionsEl.appendChild(noneOpt);
+
+      if (items.length === 0) {
+        var empty = document.createElement("div");
+        empty.className = "blocked-by-empty";
+        empty.textContent = "No matches";
+        blockedByOptionsEl.appendChild(empty);
+      } else {
+        items.forEach(function (item) {
+          var label = (item.path.length ? item.path.join(" / ") + " / " : "") + item.name;
+          var opt = document.createElement("button");
+          opt.type = "button";
+          opt.className = "blocked-by-option";
+          opt.textContent = label;
+          opt.addEventListener("mousedown", function (e) {
+            e.preventDefault();
+            selectBlockedByItem(item.id, label);
+          });
+          blockedByOptionsEl.appendChild(opt);
+        });
+      }
+    }
+
+    function openBlockedByOptions() {
+      renderBlockedByOptions(blockedByInput.value);
+      blockedByOptionsEl.hidden = false;
+      blockedByOpen = true;
+    }
+    function closeBlockedByOptions() {
+      blockedByOptionsEl.hidden = true;
+      blockedByOpen = false;
+    }
+    function revertBlockedByInput() {
+      blockedByInput.value = node.blockedBy ? blockedByLabelFor(node.blockedBy) : "";
+    }
+
+    blockedByInput.addEventListener("focus", function () {
+      blockedByInput.select();
+      openBlockedByOptions();
+    });
+    blockedByInput.addEventListener("input", openBlockedByOptions);
+    blockedByInput.addEventListener("keydown", function (e) {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        revertBlockedByInput();
+        closeBlockedByOptions();
+        blockedByInput.blur();
+      } else if (e.key === "Enter") {
+        e.preventDefault();
+        if (blockedByOpen) {
+          if (blockedByMatches.length > 0) {
+            var first = blockedByMatches[0];
+            selectBlockedByItem(first.id, (first.path.length ? first.path.join(" / ") + " / " : "") + first.name);
+          } else if (blockedByInput.value.trim() === "") {
+            selectBlockedByItem(null, "");
+          }
+        }
+        blockedByInput.blur();
+      }
+    });
+    blockedByInput.addEventListener("blur", function () {
+      setTimeout(function () {
+        closeBlockedByOptions();
+        revertBlockedByInput();
+      }, 150);
     });
 
-    blockedSelect.addEventListener("change", function () {
-      setBlockedBy(node.id, blockedSelect.value || null);
-    });
-    detailsDeps.appendChild(blockedSelect);
+    blockedByWrap.appendChild(blockedByInput);
+    blockedByWrap.appendChild(blockedByOptionsEl);
+    detailsDeps.appendChild(blockedByWrap);
 
-    if (isBlocked(node)) {
+    var activeBlockerNode = activeBlockerFor(node);
+    if (activeBlockerNode) {
       var blockedNote = document.createElement("div");
       blockedNote.className = "details-blocked-note";
-      blockedNote.textContent = 'Blocked until "' + findNode(node.blockedBy).node.name + '" is done.';
+      blockedNote.textContent = (node.blockedBy ? "" : "A parent branch is blocked. ") +
+        'Blocked until "' + activeBlockerNode.name + '" is done.';
       detailsDeps.appendChild(blockedNote);
     }
 
@@ -2131,6 +2260,8 @@ import { firebaseConfig } from "./firebase-config.js";
     if (e.key !== "Escape") return;
     if (!lightboxOverlay.hidden) {
       closeLightbox();
+    } else if (expandedTreeId) {
+      collapseBoard();
     } else if (!tagPickerOverlay.hidden) {
       closeTagPicker();
     } else if (!confirmOverlay.hidden) {

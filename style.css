@@ -566,6 +566,39 @@ body.home-view #projectHome {
   overflow-x: auto;
 }
 
+.board-expand-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(5, 6, 8, 0.7);
+  z-index: 60;
+}
+.board-expand-backdrop[hidden] {
+  display: none;
+}
+
+.expand-btn {
+  opacity: 1;
+  color: var(--text-dim);
+}
+.expand-btn:hover {
+  background: #262a33;
+  color: var(--text);
+}
+
+.tree-card-expanded {
+  position: fixed;
+  inset: 20px;
+  z-index: 61;
+  width: auto;
+  max-width: none;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+}
+.tree-card-expanded .tree-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
 .node-list {
   list-style: none;
   margin: 0;
@@ -1178,7 +1211,11 @@ body.home-view #projectHome {
   display: none;
 }
 
-.details-blocked-select {
+.blocked-by-combo {
+  position: relative;
+}
+
+.blocked-by-search-input {
   width: 100%;
   background: #14161c;
   border: 1px solid var(--border);
@@ -1189,8 +1226,46 @@ body.home-view #projectHome {
   padding: 7px 8px;
   outline: none;
 }
-.details-blocked-select:focus {
+.blocked-by-search-input:focus {
   border-color: var(--accent-dim);
+}
+
+.blocked-by-options {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  box-shadow: 0 12px 30px rgba(0,0,0,0.4);
+  max-height: 220px;
+  overflow-y: auto;
+  z-index: 10;
+  padding: 4px;
+}
+
+.blocked-by-option {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: none;
+  color: var(--text);
+  font-size: 13px;
+  padding: 7px 8px;
+  border-radius: 5px;
+  cursor: pointer;
+  overflow-wrap: anywhere;
+}
+.blocked-by-option:hover {
+  background: #262a33;
+}
+
+.blocked-by-empty {
+  color: var(--text-faint);
+  font-size: 12px;
+  padding: 7px 8px;
 }
 
 .details-blocked-note {
